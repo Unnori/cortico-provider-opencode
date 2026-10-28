@@ -22,6 +22,14 @@ OpenCode 作为供应商:一条端点接 OpenCode Console 网关,`options.protoc
 | `src/strings.ts` | 端点页与错误信息的文案 |
 | `icon.png` | 扩展图标,512×512 PNG(`cortico.icon`) |
 
+## 安装
+
+Coopanion 里:高级模式 →「扩展」→ 填包名 `cortico-provider-opencode`(可带版本,如 `cortico-provider-opencode@0.3.5`),装好重启进程。改本地目录时,扩展页填包目录的绝对路径即可挂 link,改完源码同样是重启生效。
+
+- npm:https://www.npmjs.com/package/cortico-provider-opencode
+- 仓库:https://github.com/Unnori/cortico-provider-opencode
+- 许可证:MIT
+
 ## 端点
 
 网关根是 `https://opencode.ai/inference`。地址只用来认网关,**家族路径由 `options.protocol` 决定,计费段由 `options.billing` 决定**,
