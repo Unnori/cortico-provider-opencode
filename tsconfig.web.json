@@ -1,0 +1,11 @@
+{
+  // 面板在浏览器里跑,所以这份配置带 DOM;其余源码由 tsconfig.json 检查。
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    // 面板只 import type 框架类型,而那些类型文件引用 Node 的 Buffer 与 node:crypto,所以 node 类型仍要在。
+    "types": ["node"]
+  },
+  "include": ["src/webui/client.ts", "src/webui/allowance-panel.ts"],
+  "exclude": ["node_modules", "dist"]
+}

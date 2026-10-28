@@ -1,0 +1,45 @@
+{
+  "provider": {
+    "protocols": [
+      "openai-responses",
+      "openai-chat",
+      "anthropic-messages",
+      "gemini"
+    ],
+    "auth": [
+      "api-key"
+    ],
+    "local": false,
+    "input": [
+      "text",
+      "image"
+    ],
+    "title": "OpenCode",
+    "description": "OpenCode 的模型供应商:默认走 Go 订阅的额度,支持 Responses、Chat、Messages 与 Gemini,内置价目与额度面板。",
+    "reasoningTiers": [
+      {
+        "id": "off",
+        "label": "不思考",
+        "thinking": false
+      },
+      {
+        "id": "low",
+        "label": "思考 · 快",
+        "thinking": true,
+        "effort": "low"
+      },
+      {
+        "id": "medium",
+        "label": "思考 · 标准",
+        "thinking": true,
+        "effort": "medium"
+      },
+      {
+        "id": "high",
+        "label": "思考 · 深入",
+        "thinking": true,
+        "effort": "high"
+      }
+    ]
+  }
+}
