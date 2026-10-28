@@ -1,3 +1,10 @@
+## 0.3.6
+
+- 发布物带上 MIT 许可证文件 `LICENSE`;`package.json` 补 `repository` / `homepage` / `bugs`,npm 页因此链回仓库。
+- README 增加「安装」一节:包名、link 本地目录、npm 与仓库链接。
+- 新增 `.gitattributes`:行尾统一 LF,二进制不参与转换。
+- 代码与行为未变,这一版只为把这些元数据带进发布物。
+
 ## 0.3.5
 
 - 默认协议从 `responses` 改成 `chat`。同一段 100k 上下文实测:chat 首字节 2.3 秒、总耗时 3.5 秒;responses 首字节 5.5 秒、总耗时 6.0 秒。Go 侧多数模型(GLM / Kimi / MiniMax / DeepSeek / Qwen-Max)都是 Chat 原生,responses 要网关逐条翻译整份上下文,上下文越长代价越大。GPT / Grok / Muse 这类 Responses 原生模型仍然可以手动切回。

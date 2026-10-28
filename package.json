@@ -1,6 +1,6 @@
 {
   "name": "cortico-provider-opencode",
-  "version": "0.3.5",
+  "version": "0.3.6",
   "type": "module",
   "description": "OpenCode 的模型供应商:默认走 Go 订阅的额度,支持 Responses、Chat、Messages 与 Gemini,内置价目与额度面板。",
   "license": "MIT",
