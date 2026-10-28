@@ -5,6 +5,14 @@
   "description": "OpenCode 的模型供应商:默认走 Go 订阅的额度,支持 Responses、Chat、Messages 与 Gemini,内置价目与额度面板。",
   "license": "MIT",
   "author": "云纪",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Unnori/cortico-provider-opencode.git"
+  },
+  "homepage": "https://github.com/Unnori/cortico-provider-opencode#readme",
+  "bugs": {
+    "url": "https://github.com/Unnori/cortico-provider-opencode/issues"
+  },
   "keywords": [
     "cortico-provider",
     "cortico",
@@ -31,7 +39,8 @@
     "icon.png",
     "describe.json",
     "README.md",
-    "CHANGELOG.md"
+    "CHANGELOG.md",
+    "LICENSE"
   ],
   "scripts": {
     "build:webui": "esbuild src/webui/client.ts --bundle --format=esm --platform=browser --target=es2022 --outfile=dist/webui.js",

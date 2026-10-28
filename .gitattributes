@@ -1,0 +1,4 @@
+# 行尾统一为 LF,避免 Windows 上提交后整文件 diff;二进制保持原样。
+* text=auto eol=lf
+*.png binary
+*.tgz binary
