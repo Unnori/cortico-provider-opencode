@@ -20,6 +20,7 @@ import { StreamErrorEvent } from 'cortico/providers/transport/errors.ts';
 import { renderMessagesWithMedia, type CompatMediaOptions } from 'cortico/providers/transport/history.ts';
 import { nativeChatInput, requestSpec, requestTools } from 'cortico/providers/transport/native-input.ts';
 import { identityHeaders, newSession } from './identity.ts';
+import { SignatureStore } from './signatures.ts';
 
 type Shape = Record<string, any>;
 type Part = Record<string, unknown>;
@@ -53,7 +54,7 @@ function partsOf(content: unknown): Part[] {
  * A tool result names its function, and the call id is the only thing the framework keeps; the id → name
  * map is rebuilt from the assistant turns ahead of the results.
  */
-export function buildGeminiBody(request: Request, options: GenerateOptions, media?: CompatMediaOptions): Record<string, unknown> {
+export function buildGeminiBody(request: Request, options: GenerateOptions, media?: CompatMediaOptions, signatures?: SignatureStore): Record<string, unknown> {
   const spec = requestSpec(request, options);
   const rendered = renderMessagesWithMedia(nativeChatInput(request, options), media) as Shape[];
   const names = new Map<string, string>();
@@ -79,7 +80,13 @@ export function buildGeminiBody(request: Request, options: GenerateOptions, medi
     if (message.role === 'assistant') {
       const parts = partsOf(message.content);
       for (const call of (message.tool_calls ?? []) as Shape[]) {
-        parts.push({ functionCall: { name: call.function?.name, args: parseArguments(call.function?.arguments) } });
+        // Gemini 3+ rejects a replayed functionCall without a signature; the store replays the real one
+        // and falls back to the validator-skip value for calls it never saw (older history, a restart).
+        const signature = signatures?.replay(typeof call.id === 'string' ? call.id : undefined);
+        parts.push({
+          functionCall: { name: call.function?.name, args: parseArguments(call.function?.arguments) },
+          ...(signature ? { thoughtSignature: signature } : {}),
+        });
       }
       push('model', parts);
       continue;
@@ -135,7 +142,7 @@ export class GeminiAssembly implements ResponseAssembly {
   private calls = 0;
   private finishReason: string | null = null;
 
-  constructor(request: Request) {
+  constructor(request: Request, private readonly signatures?: SignatureStore) {
     this.inner = new ChatResponseAssembly(request);
   }
 
@@ -157,8 +164,11 @@ export class GeminiAssembly implements ResponseAssembly {
       }
       if (part.functionCall) {
         const index = this.calls++;
+        const id = `call_${index}_${crypto.randomUUID().slice(0, 8)}`;
+        // Remember the signature under the id the framework will keep, so the next request can replay it.
+        this.signatures?.set(id, part.thoughtSignature ?? part.functionCall?.thoughtSignature);
         this.inner.feed({
-          choices: [{ delta: { tool_calls: [{ index, id: `call_${index}_${crypto.randomUUID().slice(0, 8)}`,
+          choices: [{ delta: { tool_calls: [{ index, id,
             function: { name: String(part.functionCall.name ?? ''), arguments: JSON.stringify(part.functionCall.args ?? {}) } }] } }],
         }, emit);
       }
@@ -179,8 +189,8 @@ export class GeminiAssembly implements ResponseAssembly {
   serviceTier(): string | null { return this.inner.serviceTier(); }
 }
 
-export function parseGeminiResponse(raw: unknown, request: Request): { response: Response; meters: TokenMeters; serviceTier: string | null } {
-  const assembler = new GeminiAssembly(request);
+export function parseGeminiResponse(raw: unknown, request: Request, signatures?: SignatureStore): { response: Response; meters: TokenMeters; serviceTier: string | null } {
+  const assembler = new GeminiAssembly(request, signatures);
   const ignore = (() => {}) as unknown as (event: StreamEvent) => void;
   assembler.feed(raw, ignore);
   const response = assembler.finish(ignore);
@@ -199,6 +209,8 @@ export class OpenCodeGemini extends OpenAIHttpClient {
   private readonly media?: CompatMediaOptions;
   private session = '';
   private readonly fallback = newSession();
+  /** Survives across rounds: the registry reuses one instance per endpoint (registry.ts keeps a cache). */
+  private readonly signatures = new SignatureStore();
 
   constructor(opts: GeminiOptions) {
     super(opts.baseUrl, opts.log ?? nullLogger());
@@ -215,7 +227,7 @@ export class OpenCodeGemini extends OpenAIHttpClient {
 
   protected override buildResponseBody(request: Request, options: GenerateOptions): Record<string, unknown> {
     this.session = options.sessionId ?? '';
-    return buildGeminiBody(request, options, this.media);
+    return buildGeminiBody(request, options, this.media, this.signatures);
   }
 
   /** The body is built whole in `buildResponseBody`. */
@@ -224,11 +236,11 @@ export class OpenCodeGemini extends OpenAIHttpClient {
   }
 
   protected override responseAssembly(request: Request): ResponseAssembly {
-    return new GeminiAssembly(request);
+    return new GeminiAssembly(request, this.signatures);
   }
 
   protected override parseResponse(raw: unknown, request: Request): { response: Response; meters: TokenMeters; serviceTier: string | null } {
-    return parseGeminiResponse(raw, request);
+    return parseGeminiResponse(raw, request, this.signatures);
   }
 
   /** Gemini streams over SSE through `alt=sse`; there is no `stream` flag in the body. */

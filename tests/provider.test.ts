@@ -15,6 +15,7 @@ import { GO_ROWS, CONSOLE_ROWS, monthlyLimit, prices, WINDOW_SHARE } from '../sr
 import { advancePercent, parseUsage } from '../src/usage.ts';
 import { buildMessagesBody, MessagesAssembly } from '../src/anthropic.ts';
 import { buildGeminiBody, GeminiAssembly, parseGeminiResponse } from '../src/gemini.ts';
+import { SignatureStore } from '../src/signatures.ts';
 import { opencodeWebUi, ALLOWANCE_PANEL } from '../src/webui/server.ts';
 import { OpenCodeResponses, SpendLedger } from '../src/native.ts';
 import { createCatalog, pickFacts } from '../src/catalog.ts';
@@ -578,5 +579,52 @@ describe('allowance readiness', () => {
     expect(await balance.invoke?.(ALLOWANCE_PANEL, 'state', [{ name: 'main' }])).toMatchObject({ ready: false });
     const foreign = opencodeWebUi(webUiHost([entry({ baseUrl: 'https://proxy.example.com/v1' })], control));
     expect(await foreign.invoke?.(ALLOWANCE_PANEL, 'state', [{ name: 'main' }])).toMatchObject({ ready: false });
+  });
+});
+describe('Gemini thought signatures', () => {
+  const withTool = (callId: string) => ({
+    model: 'gemini-4-argon',
+    input: [
+      { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'go' }] },
+      { type: 'function_call', call_id: callId, name: 'external_event_frame', arguments: '{"text":"x"}' },
+      { type: 'function_call_output', call_id: callId, output: 'ok' },
+    ],
+  }) as never;
+
+  it('replays the signature the model attached, under the call id the framework kept', () => {
+    const store = new SignatureStore();
+    store.set('call_9', 'sig-real');
+    const body = buildGeminiBody(withTool('call_9'), { nativeSpec: { model: 'gemini-4-argon', thinking: false } } as never, undefined, store) as Record<string, any>;
+    const model = body.contents.find((turn: any) => turn.role === 'model');
+    expect(model.parts[0].functionCall.name).toBe('external_event_frame');
+    expect(model.parts[0].thoughtSignature).toBe('sig-real');
+  });
+
+  it('replays the validator-skip value for a call it never saw, so the turn still goes out', () => {
+    const store = new SignatureStore();
+    const body = buildGeminiBody(withTool('call_unknown'), { nativeSpec: { model: 'gemini-4-argon', thinking: false } } as never, undefined, store) as Record<string, any>;
+    const model = body.contents.find((turn: any) => turn.role === 'model');
+    expect(model.parts[0].thoughtSignature).toBe(SignatureStore.SKIP);
+  });
+
+  it('records the signature a stream returned, keyed by the id it minted for that call', () => {
+    const store = new SignatureStore();
+    const assembly = new GeminiAssembly({ model: 'm', input: [] } as never, store);
+    const emit = (): void => {};
+    assembly.feed({ candidates: [{ content: { parts: [{ functionCall: { name: 'echo', args: {} }, thoughtSignature: 'sig-stream' }] } }] }, emit as never);
+    assembly.feed({ candidates: [{ content: { parts: [] }, finishReason: 'STOP' }] }, emit as never);
+    const response = assembly.finish(emit as never);
+    const call = response.output.find((item) => item.type === 'function_call') as any;
+    expect(store.get(call.call_id)).toBe('sig-stream');
+  });
+
+  it('keeps the store bounded so a long conversation cannot grow it without limit', () => {
+    const store = new SignatureStore(2);
+    store.set('a', '1');
+    store.set('b', '2');
+    store.set('c', '3');
+    expect(store.size).toBe(2);
+    expect(store.get('a')).toBeUndefined();
+    expect(store.get('c')).toBe('3');
   });
 });

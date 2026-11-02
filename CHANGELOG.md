@@ -1,3 +1,9 @@
+## 0.3.7
+
+- 修 Gemini 方言在带工具的第二轮直接 400:`Function call is missing a thought_signature`。Gemini 3 起要求每个 `functionCall` 回传时带上模型给它的 `thoughtSignature`,而框架的 Chat 形状历史只保留 `{ id, type, function }`,签名放不进去。
+- 新增 `src/signatures.ts`:按 call id 记住签名(有上限,长对话不会无限增长),回放历史时按 id 取回。进程重启或遇到更早的历史时,用 Gemini 文档里的 `skip_thought_signature_validator` 兜底放行,而不是丢掉这一轮。
+- 实测确认:同一段历史不带签名 → 400;带哨兵 → 200 且模型正常回话(流式同样通过)。新增 4 条测试覆盖存、取、兜底与上限。
+
 ## 0.3.6
 
 - 发布物带上 MIT 许可证文件 `LICENSE`;`package.json` 补 `repository` / `homepage` / `bugs`,npm 页因此链回仓库。
