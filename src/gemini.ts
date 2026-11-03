@@ -74,8 +74,23 @@ export function buildGeminiBody(request: Request, options: GenerateOptions, medi
   const push = (role: 'user' | 'model', parts: Part[]): void => {
     if (!parts.length) return;
     const last = contents[contents.length - 1];
-    if (last && last.role === role) last.parts.push(...parts);
-    else contents.push({ role, parts });
+    if (last && last.role === role) {
+      // Gemini requires the number of functionResponse parts in a turn to equal the number of
+      // functionCall parts in the preceding turn, so parallel results must share one turn. A text part
+      // in that turn would break it, though, so only responses merge with responses.
+      const lastIsResponse = last.parts.some((part) => 'functionResponse' in part);
+      const partsAreResponses = parts.every((part) => 'functionResponse' in part);
+      if (lastIsResponse && partsAreResponses) {
+        last.parts.push(...parts);
+        return;
+      }
+      // Plain text still joins a text turn, which keeps consecutive user messages together.
+      if (!lastIsResponse && !parts.some((part) => 'functionResponse' in part)) {
+        last.parts.push(...parts);
+        return;
+      }
+    }
+    contents.push({ role, parts });
   };
   for (const message of rendered) {
     if (message.role === 'system') {
@@ -106,11 +121,12 @@ export function buildGeminiBody(request: Request, options: GenerateOptions, medi
   }
   // Gemini refuses a request whose last content is `model` ("Requests ending with a model turn are not
   // supported"). That happens whenever the framework sends history that ends on an assistant turn — for
-  // example a round cut short after a tool call, or a turn that only pushed events. A short user turn
-  // makes the conversation well-formed again without changing what the model is asked to do.
+  // example a round cut short after a tool call, or a turn that only pushed events. The nudge is pushed
+  // as its own turn, never merged, because merging text into a response turn breaks it (see `push`).
   const tail = contents[contents.length - 1];
   if (tail && tail.role === 'model') contents.push({ role: 'user', parts: [{ text: CONTINUE_PROMPT }] });
   const body: Record<string, unknown> = { contents };
+
   if (system.length) body.systemInstruction = { parts: [{ text: system.join('\n\n') }] };
   const generationConfig: Record<string, unknown> = { maxOutputTokens: spec.maxTokens ?? DEFAULT_MAX_TOKENS };
   if (spec.temperature !== undefined) generationConfig.temperature = spec.temperature;

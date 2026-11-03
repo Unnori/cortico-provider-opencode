@@ -1,3 +1,10 @@
+## 0.3.9
+
+- 真正修掉 Gemini 的 400:0.3.8 把问题判成「历史以 model 轮收尾」,方向错了。用真实会话重放才看清:框架给每个工具结果单独一条消息,而 0.3.8 让每个 `functionResponse` 各自成轮;一个 model 轮有 2–4 个 `functionCall` 时,response 数量就对不上,网关报 `number of function response parts is equal to the number of function call parts`。
+- 规则改成:同一轮的并行结果**必须合并进同一个 response 轮**(文本绝不混入),这样 3 个 call 对 3 个 response、4 对 4。
+- 修法用真实历史验证:把 `session-main.jsonl` 的 189 条真实条目喂给改后的翻译器,配对错位从 14 处降到 **0 处**,同一份 body 发到网关返回 **200**。
+- 测试 62 → 66 条,新增并行结果合并与「文本不混入 response 轮」两条。
+
 ## 0.3.8
 
 - 修 Gemini 方言的 `400 Requests ending with a model turn are not supported`:Gemini 要求 `contents` 以 user 轮结尾,而框架在「一轮以助手消息收尾」或「推送事件打断」时,历史正好停在 model 轮上。

@@ -665,3 +665,77 @@ describe('Gemini turn order', () => {
     expect(body.contents.find((turn: any) => turn.role === 'model').parts[0].functionCall.name).toBe('echo');
   });
 });
+describe('Gemini response turns stay alone', () => {
+  const history = (tail: unknown[]) => ({
+    model: 'gemini-4-argon',
+    input: [
+      { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'send it' }] },
+      { type: 'function_call', call_id: 'call_0', name: 'qq_send', arguments: '{"text":"hi"}' },
+      ...tail,
+    ],
+  }) as never;
+
+  it('keeps a functionResponse in its own turn and does not merge the next user text into it', () => {
+    const body = buildGeminiBody(history([
+      { type: 'function_call_output', call_id: 'call_0', output: 'sent' },
+      { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'and again' }] },
+    ]), { nativeSpec: { model: 'gemini-4-argon', thinking: false } } as never) as Record<string, any>;
+    const responseTurn = body.contents.find((turn: any) => turn.parts.some((part: any) => 'functionResponse' in part));
+    expect(responseTurn.parts).toHaveLength(1);
+    const after = body.contents[body.contents.length - 1];
+    expect(after.role).toBe('user');
+    expect(after.parts.some((part: any) => 'functionResponse' in part)).toBe(false);
+  });
+
+  it('leaves a history that ends on a lone functionResponse untouched', () => {
+    const body = buildGeminiBody(history([
+      { type: 'function_call_output', call_id: 'call_0', output: 'sent' },
+    ]), { nativeSpec: { model: 'gemini-4-argon', thinking: false } } as never) as Record<string, any>;
+    const last = body.contents[body.contents.length - 1];
+    expect(last.role).toBe('user');
+    expect(last.parts).toHaveLength(1);
+    expect('functionResponse' in last.parts[0]).toBe(true);
+  });
+});
+describe('Gemini parallel tool results', () => {
+  it('puts every result of one call turn into a single response turn', () => {
+    const parallel = {
+      model: 'gemini-4-argon',
+      input: [
+        { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'read three files' }] },
+        { type: 'function_call', call_id: 'call_0', name: 'read_file', arguments: '{"p":"a"}' },
+        { type: 'function_call', call_id: 'call_1', name: 'read_file', arguments: '{"p":"b"}' },
+        { type: 'function_call', call_id: 'call_2', name: 'read_file', arguments: '{"p":"c"}' },
+        { type: 'function_call_output', call_id: 'call_0', output: 'A' },
+        { type: 'function_call_output', call_id: 'call_1', output: 'B' },
+        { type: 'function_call_output', call_id: 'call_2', output: 'C' },
+      ],
+    } as never;
+    const body = buildGeminiBody(parallel, { nativeSpec: { model: 'gemini-4-argon', thinking: false } } as never) as Record<string, any>;
+    const callTurn = body.contents.find((turn: any) => turn.parts.some((part: any) => 'functionCall' in part));
+    const responseTurn = body.contents.find((turn: any) => turn.parts.some((part: any) => 'functionResponse' in part));
+    expect(callTurn.parts.filter((part: any) => 'functionCall' in part)).toHaveLength(3);
+    // The API counts parts, so three calls need exactly three responses in the very next turn.
+    expect(responseTurn.parts.filter((part: any) => 'functionResponse' in part)).toHaveLength(3);
+    expect(responseTurn.parts).toHaveLength(3);
+    const turnAfterResponse = body.contents[body.contents.indexOf(responseTurn) + 1];
+    expect(turnAfterResponse).toBeUndefined();
+  });
+
+  it('never merges a text part into a response turn', () => {
+    const mixed = {
+      model: 'gemini-4-argon',
+      input: [
+        { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'go' }] },
+        { type: 'function_call', call_id: 'call_0', name: 'echo', arguments: '{}' },
+        { type: 'function_call_output', call_id: 'call_0', output: 'ok' },
+        { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'thanks' }] },
+      ],
+    } as never;
+    const body = buildGeminiBody(mixed, { nativeSpec: { model: 'gemini-4-argon', thinking: false } } as never) as Record<string, any>;
+    const responseTurn = body.contents.find((turn: any) => turn.parts.some((part: any) => 'functionResponse' in part));
+    expect(responseTurn.parts).toHaveLength(1);
+    const last = body.contents[body.contents.length - 1];
+    expect(last.parts.some((part: any) => 'text' in part)).toBe(true);
+  });
+});
