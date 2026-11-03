@@ -1,6 +1,7 @@
 /**
- * The two per-endpoint choices. Both live in `options.*` so an endpoint stays plain Cortico config:
- * `protocol` picks the request shape, `billing` picks the account that pays.
+ * The per-endpoint choices. All live in `options.*` so an endpoint stays plain Cortico config:
+ * `protocol` picks the request shape, `billing` picks the account that pays, `keys` lists the secret
+ * variable names this endpoint may use with one after another.
  */
 import type { LLMProviderEntry } from 'cortico/core/types.ts';
 import type { Protocol } from './address.ts';
@@ -25,6 +26,11 @@ export interface OpenCodeOptions {
   protocol?: Protocol;
   /** Unset: `go`. */
   billing?: Billing;
+  /**
+   * Secret variable names in priority order, separated by semicolons. The endpoint spends the first key
+   * until the account refuses it, then moves to the next; empty or a single name means no rotation.
+   */
+  keys?: string;
 }
 
 export const optionsOf = (entry: LLMProviderEntry): OpenCodeOptions => (entry.options ?? {}) as OpenCodeOptions;
@@ -32,3 +38,17 @@ export const optionsOf = (entry: LLMProviderEntry): OpenCodeOptions => (entry.op
 export const protocolOf = (entry: LLMProviderEntry): Protocol => optionsOf(entry).protocol ?? DEFAULT_PROTOCOL;
 
 export const billingOf = (entry: LLMProviderEntry): Billing => optionsOf(entry).billing ?? DEFAULT_BILLING;
+
+/**
+ * The key names this endpoint may use, in the order it must try them. `entry.secret` stays first so a
+ * single-key endpoint behaves exactly as before, and a second name can only be reached when the
+ * operator listed one.
+ */
+export function keyNamesOf(entry: LLMProviderEntry): string[] {
+  const listed = optionsOf(entry).keys;
+  const extra = typeof listed === 'string' ? listed.split(/[;,\s]+/) : [];
+  const names = [entry.secret, ...extra]
+    .filter((name): name is string => typeof name === 'string' && name.trim().length > 0)
+    .map((name) => name.trim());
+  return [...new Set(names)];
+}

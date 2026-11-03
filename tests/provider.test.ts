@@ -7,7 +7,8 @@ import type { LLMProviderEntry } from 'cortico/core/types.ts';
 import type { ProviderHost } from 'cortico/providers/base.ts';
 import type { ProviderWebUiHost } from 'cortico/providers/webui/types.ts';
 import OPENCODE, { BILLING_OPTIONS, DEFAULT_BILLING, billingOf, protocolOf } from '../src/index.ts';
-import { DEFAULT_PROTOCOL } from '../src/options.ts';
+import { DEFAULT_PROTOCOL, keyNamesOf } from '../src/options.ts';
+import { createKeyCursor } from '../src/rotation.ts';
 import { baseUrlOf, familyOf, modelListUrl, parseGateway, PROTOCOLS, usageUrl } from '../src/address.ts';
 import { modelsUrl } from '../src/catalog.ts';
 import { USER_AGENT } from '../src/identity.ts';
@@ -737,5 +738,53 @@ describe('Gemini parallel tool results', () => {
     expect(responseTurn.parts).toHaveLength(1);
     const last = body.contents[body.contents.length - 1];
     expect(last.parts.some((part: any) => 'text' in part)).toBe(true);
+  });
+});
+describe('key rotation', () => {
+  const secrets = (map: Record<string, string>) => (name: string): string => map[name] ?? '';
+  const entryWith = (names: string): never => ({ kind: 'opencode', baseUrl: 'https://opencode.ai/inference/go/openai/v1', secret: 'A', options: { keys: names } }) as never;
+
+  it('lists entry.secret first, then the configured names without duplicates', () => {
+    expect(keyNamesOf(entryWith('B;C'))).toEqual(['A', 'B', 'C']);
+    expect(keyNamesOf(entryWith('A;B'))).toEqual(['A', 'B']);
+    expect(keyNamesOf(entryWith(''))).toEqual(['A']);
+    expect(keyNamesOf({ kind: 'opencode', baseUrl: 'https://opencode.ai/inference', secret: undefined }) as never).toEqual([]);
+  });
+
+  it('uses one key alone when only one name is configured and never rotates', () => {
+    let refused = 0;
+    const cursor = createKeyCursor({ names: ['A'], read: secrets({ A: 'k1' }) });
+    expect(cursor.current()).toEqual({ name: 'A', value: 'k1' });
+    cursor.refuse();
+    expect(cursor.current()).toEqual({ name: 'A', value: 'k1' });
+    expect(refused).toBe(0);
+    expect(cursor.index()).toBe(0);
+  });
+
+  it('keeps spending the first key until it is refused, then moves on in order', () => {
+    const cursor = createKeyCursor({ names: ['A', 'B'], read: secrets({ A: 'k1', B: 'k2' }) });
+    // Priority order: the first key stays in use across every call, which is what keeps the cache warm.
+    for (let i = 0; i < 5; i++) expect(cursor.current()?.value).toBe('k1');
+    cursor.refuse();
+    expect(cursor.current()?.value).toBe('k2');
+    expect(cursor.index()).toBe(1);
+    for (let i = 0; i < 5; i++) expect(cursor.current()?.value).toBe('k2');
+  });
+
+  it('never goes back to a key it already refused', () => {
+    const cursor = createKeyCursor({ names: ['A', 'B', 'C'], read: secrets({ A: 'k1', B: 'k2', C: 'k3' }) });
+    cursor.refuse();
+    expect(cursor.current()?.value).toBe('k2');
+    cursor.refuse();
+    expect(cursor.current()?.value).toBe('k3');
+    // A refusal means the window is spent; returning early would cost the cache for a blocked key.
+    cursor.refuse();
+    expect(cursor.current()?.value).toBe('k3');
+    expect(cursor.index()).toBe(2);
+  });
+
+  it('skips a name with no value instead of sending an empty key', () => {
+    const cursor = createKeyCursor({ names: ['A', 'B'], read: secrets({ B: 'k2' }) });
+    expect(cursor.current()).toEqual({ name: 'B', value: 'k2' });
   });
 });

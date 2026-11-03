@@ -14,7 +14,8 @@ import type { ConfigGroup, LLMProviderEntry, ReasoningTier } from 'cortico/core/
 import type { Language } from 'cortico/core/language.ts';
 import { isContextOverflow } from 'cortico/providers/transport/errors.ts';
 import { baseUrlOf, parseGateway, PROTOCOLS, type Protocol } from './address.ts';
-import { BILLING_OPTIONS, billingOf, DEFAULT_MAX_TOKENS, DEFAULT_TEMPERATURE, optionsOf, protocolOf } from './options.ts';
+import { BILLING_OPTIONS, billingOf, DEFAULT_MAX_TOKENS, DEFAULT_TEMPERATURE, keyNamesOf, optionsOf, protocolOf } from './options.ts';
+import { createKeyCursor } from './rotation.ts';
 import { createCatalog } from './catalog.ts';
 import { OpenCodeProvider, SpendLedger } from './native.ts';
 import { prices, type Billing, type UsageWindow } from './pricing.ts';
@@ -37,6 +38,7 @@ function optionsGroup(name: string, language: Language): ConfigGroup {
       properties: {
         [`providers.${name}.options.protocol`]: { type: 'string', enum: [...PROTOCOLS], title: t.protocol, description: t.protocolHint },
         [`providers.${name}.options.billing`]: { type: 'string', enum: [...BILLING_OPTIONS], title: t.billing, description: t.billingHint },
+        [`providers.${name}.options.keys`]: { type: 'string', title: t.keys, description: t.keysHint },
       },
     },
   };
@@ -111,7 +113,6 @@ export const OPENCODE = {
   contextOverflow: isContextOverflow,
   webUi: opencodeWebUi,
   create(name: string, entry: LLMProviderEntry, host): ProviderInstance {
-    const apiKey = entry.secret ? host.secret(entry.secret) : undefined;
     const gateway = parseGateway(entry.baseUrl);
     const billing = billingOf(entry);
     const protocol = protocolOf(entry);
@@ -119,10 +120,16 @@ export const OPENCODE = {
     const session = newSession();
     const catalog = createCatalog({ baseUrl: entry.baseUrl, billing, cacheFile: join(host.stateDir, 'models.json') });
     const currentEntry = () => host.currentEntry?.() ?? entry;
+    // The names are read from the saved entry, the values through `host.secret`, so an operator can add
+    // a second key without this instance being rebuilt.
+    const cursor = createKeyCursor({ names: keyNamesOf(entry), read: (keyName) => host.secret(keyName) });
+    const apiKey = entry.secret ? host.secret(entry.secret) : undefined;
     const provider = new OpenCodeProvider({
       baseUrl: gateway ? baseUrlOf(gateway, billing, protocol) : entry.baseUrl,
       protocol,
       apiKey,
+      apiKeyOf: () => cursor.current()?.value,
+      onKeyRefused: () => cursor.refuse(),
       log: host.log,
       media: { enabled: () => currentEntry().multimodal === true, read: host.readBlob },
       keepThinking: host.keepThinking,
@@ -131,8 +138,9 @@ export const OPENCODE = {
     const control: UsageControl = {
       hasKey: () => Boolean(entry.secret && host.secret(entry.secret)),
       read: async () => {
-        // The key is read again here: the operator may have saved it after this instance was built.
-        const key = entry.secret ? host.secret(entry.secret) : undefined;
+        // The key is read again here: the operator may have saved it after this instance was built,
+        // and allowance belongs to the account the current key pays with.
+        const key = cursor.current()?.value ?? (entry.secret ? host.secret(entry.secret) : undefined);
         const usage = await readUsage(gateway!, key, session);
         ledger.clear();
         return usage;

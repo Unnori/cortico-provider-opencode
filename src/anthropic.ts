@@ -214,12 +214,17 @@ export function parseMessages(raw: unknown, request: Request): { response: Respo
 export interface MessagesOptions {
   baseUrl: string;
   apiKey?: string;
+  /** Read per attempt so a refused key can be swapped for the next one; takes precedence over `apiKey`. */
+  apiKeyOf?: () => string | undefined;
+  onKeyRefused?: () => void;
   log?: Logger;
   media?: CompatMediaOptions;
 }
 
 export class OpenCodeMessages extends OpenAIHttpClient {
   private readonly apiKey?: string;
+  private readonly apiKeyOf?: () => string | undefined;
+  private readonly onKeyRefused?: () => void;
   private readonly media?: CompatMediaOptions;
   private session = '';
   private readonly fallback = newSession();
@@ -228,6 +233,8 @@ export class OpenCodeMessages extends OpenAIHttpClient {
     super(opts.baseUrl, opts.log ?? nullLogger());
     this.chatPath = '/messages';
     this.apiKey = opts.apiKey;
+    this.apiKeyOf = opts.apiKeyOf;
+    this.onKeyRefused = opts.onKeyRefused;
     this.media = opts.media;
   }
 
@@ -257,12 +264,25 @@ export class OpenCodeMessages extends OpenAIHttpClient {
     body.stream = true;
   }
 
+  /** The key for this attempt, so rotation happens between transport attempts rather than per request. */
+  private key(): string | undefined {
+    return this.apiKeyOf?.() ?? this.apiKey;
+  }
+
+  /** Answering true makes the framework retry once, with the next key in the header. */
+  protected override async onAuthError(): Promise<boolean> {
+    if (!this.onKeyRefused || !this.apiKeyOf) return false;
+    this.onKeyRefused();
+    return true;
+  }
+
   protected headers(): Record<string, string> {
+    const key = this.key();
     return {
       'Content-Type': 'application/json',
       'anthropic-version': ANTHROPIC_VERSION,
       ...identityHeaders(this.session || this.fallback),
-      ...(this.apiKey ? { Authorization: `Bearer ${this.apiKey}` } : {}),
+      ...(key ? { Authorization: `Bearer ${key}` } : {}),
     };
   }
 }

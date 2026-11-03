@@ -10,6 +10,8 @@ export interface OpenCodeText {
   protocol: string;
   protocolHint: string;
   billing: string;
+  keys: string;
+  keysHint: string;
   billingHint: string;
   badProtocol(allowed: string): string;
   badBilling(allowed: string): string;
@@ -49,6 +51,8 @@ const zh: OpenCodeText = {
   protocolHint: 'chat 走 /chat/completions,是多数模型的原生路径,实测最快;GPT / Grok / Muse 这类 Responses 原生模型选 responses;Messages 与 Gemini 各有专用家族路径。Console 会把每个文本模型翻译到你选的这一套,翻译要按上下文逐条做。',
   billing: '计费账户',
   billingHint: 'go 走 Go 订阅的额度,balance 走 Console 余额。额度窗口只对 Go 有。',
+  keys: '备用密钥变量名',
+  keysHint: '按顺序用分号分隔,例如 CORTICO_KEY_B;CORTICO_KEY_C。当前密钥被拒(额度用完或限流)后才换下一条;留空则只用端点自己那条。额度读数报的是当前在用的那条。',
   badProtocol: (allowed) => `协议只能是 ${allowed}。`,
   badBilling: (allowed) => `计费账户只能是 ${allowed}。`,
   allowancePanel: '订阅额度',
@@ -92,6 +96,8 @@ const zhHant: OpenCodeText = {
   protocolHint: 'chat 走 /chat/completions,是多數模型的原生路徑,實測最快;GPT / Grok / Muse 這類 Responses 原生模型選 responses;Messages 與 Gemini 各有專用家族路徑。Console 會把每個文字模型翻譯到你選的這一套,翻譯要按上下文逐條做。',
   billing: '計費帳戶',
   billingHint: 'go 走 Go 訂閱的額度,balance 走 Console 餘額。額度視窗只對 Go 有。',
+  keys: '備用金鑰變數名',
+  keysHint: '按順序以分號分隔,例如 CORTICO_KEY_B;CORTICO_KEY_C。目前金鑰被拒(額度用完或限流)後才換下一條;留空則只用端點自己那條。額度讀數報的是目前使用中的那條。',
   badProtocol: (allowed) => `協定只能是 ${allowed}。`,
   badBilling: (allowed) => `計費帳戶只能是 ${allowed}。`,
   allowancePanel: '訂閱額度',
@@ -135,6 +141,8 @@ const en: OpenCodeText = {
   protocolHint: 'chat posts to /chat/completions, the native path for most models and the fastest one measured; pick responses for Responses-native models such as GPT, Grok and Muse; Messages and Gemini have their own family paths. Console translates every text model to whichever one you pick, item by item across the whole context.',
   billing: 'Billed to',
   billingHint: 'go spends the Go subscription allowance, balance spends Console credit. Only Go has allowance windows.',
+  keys: 'Fallback key names',
+  keysHint: 'Separated by semicolons, in the order to try them, for example CORTICO_KEY_B;CORTICO_KEY_C. The next key is used only after the current one is refused (allowance spent or rate limited). Empty means this endpoint uses its own key alone. The allowance read always reports the key in use.',
   badProtocol: (allowed) => `Protocol must be ${allowed}.`,
   badBilling: (allowed) => `Billing must be ${allowed}.`,
   allowancePanel: 'Subscription allowance',

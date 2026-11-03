@@ -28,6 +28,9 @@ export { OpenCodeMessages, OpenCodeGemini };
 export interface ClientOptions {
   baseUrl: string;
   apiKey?: string;
+  /** Read per attempt so a refused key can be swapped for the next one; takes precedence over `apiKey`. */
+  apiKeyOf?: () => string | undefined;
+  onKeyRefused?: () => void;
   log?: Logger;
   media?: CompatMediaOptions;
 }
@@ -39,6 +42,8 @@ export interface ClientOptions {
  */
 export class OpenCodeChat extends OpenAIHttpClient {
   private readonly apiKey?: string;
+  private readonly apiKeyOf?: () => string | undefined;
+  private readonly onKeyRefused?: () => void;
   private readonly media?: CompatMediaOptions;
   private session = '';
   /** The probe carries no conversation id, and the gateway refuses a request without one. */
@@ -47,11 +52,28 @@ export class OpenCodeChat extends OpenAIHttpClient {
   constructor(opts: ClientOptions) {
     super(opts.baseUrl, opts.log ?? nullLogger());
     this.apiKey = opts.apiKey;
+    this.apiKeyOf = opts.apiKeyOf;
+    this.onKeyRefused = opts.onKeyRefused;
     this.media = opts.media;
   }
 
   setBaseUrl(baseUrl: string): void {
     this.baseUrl = baseUrl;
+  }
+
+  /**
+   * The framework asks this after 401/403; answering true makes it retry once, which is how a refused
+   * key hands the attempt to the next one instead of failing the turn.
+   */
+  protected override async onAuthError(): Promise<boolean> {
+    if (!this.onKeyRefused || !this.apiKeyOf) return false;
+    this.onKeyRefused();
+    return true;
+  }
+
+  /** The key for this attempt, so rotation happens between transport attempts rather than per request. */
+  protected key(): string | undefined {
+    return this.apiKeyOf?.() ?? this.apiKey;
   }
 
   protected buildBody(spec: ModelSpec, messages: NativeChatMessage[], tools?: ToolSchema[], sessionId?: string): Record<string, unknown> {
@@ -69,10 +91,11 @@ export class OpenCodeChat extends OpenAIHttpClient {
   }
 
   protected headers(): Record<string, string> {
+    const key = this.key();
     return {
       'Content-Type': 'application/json',
       ...identityHeaders(this.session || this.fallback),
-      ...(this.apiKey ? { Authorization: `Bearer ${this.apiKey}` } : {}),
+      ...(key ? { Authorization: `Bearer ${key}` } : {}),
     };
   }
 }
@@ -81,13 +104,24 @@ export class OpenCodeChat extends OpenAIHttpClient {
 export class OpenCodeResponses extends ResponsesProvider {
   private session = '';
   private readonly fallback = newSession();
+  private readonly apiKeyOf?: () => string | undefined;
+  private readonly onKeyRefused?: () => void;
 
-  constructor(opts: ResponsesProviderOptions) {
+  constructor(opts: ResponsesProviderOptions & { apiKeyOf?: () => string | undefined; onKeyRefused?: () => void }) {
     super(opts);
+    this.apiKeyOf = opts.apiKeyOf;
+    this.onKeyRefused = opts.onKeyRefused;
   }
 
   setBaseUrl(baseUrl: string): void {
     this.baseUrl = baseUrl;
+  }
+
+  /** Answering true makes the framework retry once, with the next key in the header. */
+  protected override async onAuthError(): Promise<boolean> {
+    if (!this.onKeyRefused || !this.apiKeyOf) return false;
+    this.onKeyRefused();
+    return true;
   }
 
   protected override buildResponseBody(request: Request, options: GenerateOptions): Record<string, unknown> {
@@ -96,8 +130,13 @@ export class OpenCodeResponses extends ResponsesProvider {
   }
 
   protected override headers(): Record<string, string> {
+    // The parent builds the API key header from its own copy of the options, so the key this client may
+    // rotate has to replace it here rather than be inherited.
+    const inherited = super.headers();
+    const key = this.apiKeyOf?.();
+    const withKey = key ? { ...inherited, Authorization: `Bearer ${key}` } : inherited;
     return {
-      ...super.headers(),
+      ...withKey,
       ...identityHeaders(this.session || this.fallback),
     };
   }
@@ -129,6 +168,8 @@ export interface ProviderOptions extends ClientOptions {
   protocol: Protocol;
   keepThinking: () => boolean;
   ledger?: SpendLedger;
+  /** Called when the account refuses the key in use, so the next attempt uses the following one. */
+  onKeyRefused?: () => void;
 }
 
 /** One endpoint: the protocol picks the client, and every finished generation feeds the local ledger. */
@@ -139,7 +180,14 @@ export class OpenCodeProvider extends BaseProvider {
   constructor(opts: ProviderOptions) {
     super();
     this.ledger = opts.ledger;
-    const shared = { baseUrl: opts.baseUrl, apiKey: opts.apiKey, log: opts.log, media: opts.media };
+    const shared = {
+      baseUrl: opts.baseUrl,
+      apiKey: opts.apiKey,
+      apiKeyOf: opts.apiKeyOf,
+      log: opts.log,
+      media: opts.media,
+      onKeyRefused: opts.onKeyRefused,
+    };
     this.client = opts.protocol === 'anthropic'
       ? new OpenCodeMessages(shared)
       : opts.protocol === 'gemini'
