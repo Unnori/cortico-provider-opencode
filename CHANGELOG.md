@@ -1,3 +1,9 @@
+## 0.3.8
+
+- 修 Gemini 方言的 `400 Requests ending with a model turn are not supported`:Gemini 要求 `contents` 以 user 轮结尾,而框架在「一轮以助手消息收尾」或「推送事件打断」时,历史正好停在 model 轮上。
+- 翻译器发现末轮是 model 时补一条极短的 user 轮(`(继续。)`),让请求重新合法;已经以 user 结尾的历史不动。悬空的 `functionCall` 也一并覆盖。
+- 实测:同一段历史以 model 结尾 → 400;补一条 user 轮 → 200 且正常作答(流式同样通过,并仍返回签名)。新增 3 条测试。
+
 ## 0.3.7
 
 - 修 Gemini 方言在带工具的第二轮直接 400:`Function call is missing a thought_signature`。Gemini 3 起要求每个 `functionCall` 回传时带上模型给它的 `thoughtSignature`,而框架的 Chat 形状历史只保留 `{ id, type, function }`,签名放不进去。

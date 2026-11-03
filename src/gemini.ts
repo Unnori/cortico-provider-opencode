@@ -27,6 +27,12 @@ type Part = Record<string, unknown>;
 
 const DEFAULT_MAX_TOKENS = 8192;
 
+/**
+ * The turn appended when history ends on a model turn. It has to be a user turn for the API to accept
+ * the request; the wording keeps the nudge small and neutral so it does not steer the reply.
+ */
+const CONTINUE_PROMPT = '(继续。)'
+
 function textOf(content: unknown): string {
   if (typeof content === 'string') return content;
   if (!Array.isArray(content)) return '';
@@ -98,6 +104,12 @@ export function buildGeminiBody(request: Request, options: GenerateOptions, medi
     }
     push('user', partsOf(message.content));
   }
+  // Gemini refuses a request whose last content is `model` ("Requests ending with a model turn are not
+  // supported"). That happens whenever the framework sends history that ends on an assistant turn — for
+  // example a round cut short after a tool call, or a turn that only pushed events. A short user turn
+  // makes the conversation well-formed again without changing what the model is asked to do.
+  const tail = contents[contents.length - 1];
+  if (tail && tail.role === 'model') contents.push({ role: 'user', parts: [{ text: CONTINUE_PROMPT }] });
   const body: Record<string, unknown> = { contents };
   if (system.length) body.systemInstruction = { parts: [{ text: system.join('\n\n') }] };
   const generationConfig: Record<string, unknown> = { maxOutputTokens: spec.maxTokens ?? DEFAULT_MAX_TOKENS };

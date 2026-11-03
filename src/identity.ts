@@ -3,7 +3,7 @@
  * than look like a generic SDK, and to send a stable session id so it can route and cache prompts —
  * the Go endpoints refuse a request that carries none, so one is always sent.
  */
-export const USER_AGENT = 'cortico-provider-opencode/0.3.7';
+export const USER_AGENT = 'cortico-provider-opencode/0.3.8';
 export const SESSION_HEADER = 'x-opencode-session';
 
 /**

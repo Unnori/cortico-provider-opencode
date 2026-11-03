@@ -628,3 +628,40 @@ describe('Gemini thought signatures', () => {
     expect(store.get('c')).toBe('3');
   });
 });
+describe('Gemini turn order', () => {
+  const endingOnModel = {
+    model: 'gemini-4-argon',
+    input: [
+      { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'go' }] },
+      { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'done' }] },
+    ],
+  } as never;
+
+  it('appends a user turn when history ends on a model turn, which the API refuses otherwise', () => {
+    const body = buildGeminiBody(endingOnModel, { nativeSpec: { model: 'gemini-4-argon', thinking: false } } as never) as Record<string, any>;
+    const last = body.contents[body.contents.length - 1];
+    expect(last.role).toBe('user');
+    expect(body.contents[0].role).toBe('user');
+    expect(body.contents.some((turn: any) => turn.role === 'model')).toBe(true);
+  });
+
+  it('leaves a history that already ends on a user turn alone', () => {
+    const body = buildGeminiBody({ model: 'm', input: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'hi' }] }] } as never,
+      { nativeSpec: { model: 'm', thinking: false } } as never) as Record<string, any>;
+    expect(body.contents).toHaveLength(1);
+    expect(body.contents[0].role).toBe('user');
+  });
+
+  it('appends a user turn after a dangling tool call too', () => {
+    const dangling = {
+      model: 'm',
+      input: [
+        { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'go' }] },
+        { type: 'function_call', call_id: 'call_7', name: 'echo', arguments: '{}' },
+      ],
+    } as never;
+    const body = buildGeminiBody(dangling, { nativeSpec: { model: 'm', thinking: false } } as never) as Record<string, any>;
+    expect(body.contents[body.contents.length - 1].role).toBe('user');
+    expect(body.contents.find((turn: any) => turn.role === 'model').parts[0].functionCall.name).toBe('echo');
+  });
+});

@@ -64,7 +64,7 @@ Coopanion 里:高级模式 →「扩展」→ 填包名 `cortico-provider-openco
 Console 把每个文本模型翻译到被问的那一套,所以四种协议都覆盖全部文本模型;换协议只改请求形状。
 Messages 方言不发送思维链:Messages 把思考写成 token 预算,而 Console 怎么把 OpenAI 风格的 effort 映到预算没有文档。
 
-Gemini 3 起要求每个 `functionCall` 回传时带上模型给它的 `thoughtSignature`,而框架的历史只存 `{ id, type, function }`,放不下这个字段。所以 `src/signatures.ts` 按 call id 记住签名、回放时按 id 取回;进程重启或遇到更早的历史时,用文档里的 `skip_thought_signature_validator` 兜底放行——不带签名必然是 400,带哨兵则照常作答。
+Gemini 要求 `contents` 以 **user 轮**结尾,而框架的历史在「一轮以助手消息收尾」或「被事件推送打断」时会停在 model 轮上,于是报 `Requests ending with a model turn are not supported`。翻译器发现末轮是 model 就补一条极短的 user 轮(`(继续。)`),已经以 user 结尾的历史不动。`src/signatures.ts` 则负责签名:Gemini 3 起要求每个 `functionCall` 回传时带上模型给它的 `thoughtSignature`,而框架的历史只存 `{ id, type, function }`,放不下这个字段。所以 `src/signatures.ts` 按 call id 记住签名、回放时按 id 取回;进程重启或遇到更早的历史时,用文档里的 `skip_thought_signature_validator` 兜底放行——不带签名必然是 400,带哨兵则照常作答。
 
 **为什么默认 chat**:同一段 100k 上下文实测,chat 首字节 2.3 秒、总耗时 3.5 秒;responses 首字节 5.5 秒、总耗时 6.0 秒。responses 让网关把整份上下文逐条翻成 Chat,上下文越长代价越大——工具定义与并发都不影响这个数(实测过),只有协议与上下文规模影响。
 
