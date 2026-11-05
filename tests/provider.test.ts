@@ -788,3 +788,39 @@ describe('key rotation', () => {
     expect(cursor.current()).toEqual({ name: 'B', value: 'k2' });
   });
 });
+describe('Messages stream that ends without its terminal event', () => {
+  const request = { model: 'claude-haiku-5-5', input: [] } as never;
+
+  it('closes the turn when the stream stops after content but before message_delta', () => {
+    const assembly = new MessagesAssembly(request);
+    const emit = (): void => {};
+    assembly.feed({ type: 'message_start', message: { id: 'msg_1', model: 'claude-haiku-5-5' } }, emit as never);
+    assembly.feed({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }, emit as never);
+    assembly.feed({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: '好的' } }, emit as never);
+    // The connection drops here: no content_block_stop, no message_delta, no message_stop.
+    const response = assembly.finish(emit as never);
+    expect(response.status).toBe('completed');
+    const message = response.output.find((item) => item.type === 'message') as any;
+    expect(message.content[0].text).toBe('好的');
+  });
+
+  it('still closes normally when message_delta did arrive, without a second terminal chunk', () => {
+    const assembly = new MessagesAssembly(request);
+    const emit = (): void => {};
+    assembly.feed({ type: 'message_start', message: { id: 'msg_1', model: 'm' } }, emit as never);
+    assembly.feed({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'hi' } }, emit as never);
+    assembly.feed({ type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { input_tokens: 5, output_tokens: 2 } }, emit as never);
+    const response = assembly.finish(emit as never);
+    expect(response.status).toBe('completed');
+    expect(assembly.meters().output).toBe(2);
+  });
+
+  it('maps a max_tokens stop to an incomplete turn', () => {
+    const assembly = new MessagesAssembly(request);
+    const emit = (): void => {};
+    assembly.feed({ type: 'message_start', message: { id: 'msg_1', model: 'm' } }, emit as never);
+    assembly.feed({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'cut' } }, emit as never);
+    assembly.feed({ type: 'message_delta', delta: { stop_reason: 'max_tokens' } }, emit as never);
+    expect(assembly.finish(emit as never).status).toBe('incomplete');
+  });
+});

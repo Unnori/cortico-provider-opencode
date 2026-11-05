@@ -132,6 +132,8 @@ export class MessagesAssembly implements ResponseAssembly {
   private readonly tools = new Map<number, { id: string; name: string; arguments: string }>();
   private stopReason = 'end_turn';
   private usage: Rendered | null = null;
+  /** Set once the terminal chunk has been fed, so `finish` never feeds a second one. */
+  private closed = false;
 
   constructor(request: Request) {
     this.inner = new ChatResponseAssembly(request);
@@ -184,11 +186,24 @@ export class MessagesAssembly implements ResponseAssembly {
         ...(usage ? { usage } : {}),
         choices: [{ delta: {}, finish_reason: STOP_REASONS[this.stopReason] ?? 'stop' }],
       }, emit);
+      this.closed = true;
       return;
     }
   }
 
-  finish(emit: (event: StreamEvent) => void): Response { return this.inner.finish(emit); }
+  /**
+   * A stream can end after its content without the terminal chunk: `message_delta` is the only event
+   * that carries the stop reason and the usage, and a connection dropped just before it would otherwise
+   * surface as "Chat transport ended without finish_reason". Closing here turns that into a completed
+   * turn, the same way the Gemini translator closes a stream that never sent a finish reason.
+   */
+  finish(emit: (event: StreamEvent) => void): Response {
+    if (!this.closed) {
+      this.closed = true;
+      this.inner.feed({ choices: [{ delta: {}, finish_reason: STOP_REASONS[this.stopReason] ?? 'stop' }] }, emit);
+    }
+    return this.inner.finish(emit);
+  }
   snapshot(): Response | null { return this.inner.snapshot(); }
   meters(): TokenMeters { return this.inner.meters(); }
   serviceTier(): string | null { return this.inner.serviceTier(); }
