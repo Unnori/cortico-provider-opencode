@@ -16,6 +16,7 @@ import { isContextOverflow } from 'cortico/providers/transport/errors.ts';
 import { baseUrlOf, parseGateway, PROTOCOLS, type Protocol } from './address.ts';
 import { BILLING_OPTIONS, billingOf, DEFAULT_MAX_TOKENS, DEFAULT_TEMPERATURE, keyNamesOf, optionsOf, protocolOf } from './options.ts';
 import { createKeyCursor } from './rotation.ts';
+import { guardedMedia } from './images.ts';
 import { createCatalog } from './catalog.ts';
 import { OpenCodeProvider, SpendLedger } from './native.ts';
 import { prices, type Billing, type UsageWindow } from './pricing.ts';
@@ -131,7 +132,13 @@ export const OPENCODE = {
       apiKeyOf: () => cursor.current()?.value,
       onKeyRefused: () => cursor.refuse(),
       log: host.log,
-      media: { enabled: () => currentEntry().multimodal === true, read: host.readBlob },
+      media: guardedMedia({
+        enabled: () => currentEntry().multimodal === true,
+        read: host.readBlob,
+        onDropped: ({ handle, size, limit, count }) => host.log.warn('opencode: image left out of the request', {
+          handle, width: size.width, height: size.height, limit, count,
+        }),
+      }),
       keepThinking: host.keepThinking,
       ledger,
     });
