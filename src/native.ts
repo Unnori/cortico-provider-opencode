@@ -21,6 +21,7 @@ import { OpenCodeMessages } from './anthropic.ts';
 import { OpenCodeGemini } from './gemini.ts';
 import { identityHeaders, newSession } from './identity.ts';
 import type { LocalSpend } from './usage.ts';
+import { salvagePartial } from './salvage.ts';
 
 export { USER_AGENT } from './identity.ts';
 export { OpenCodeMessages, OpenCodeGemini };
@@ -198,9 +199,18 @@ export class OpenCodeProvider extends BaseProvider {
   }
 
   override async respond(request: Request, options: GenerateOptions = {}): Promise<Generation> {
-    const generation = await this.client.respond(request, options);
-    this.record(request, generation);
-    return generation;
+    try {
+      const generation = await this.client.respond(request, options);
+      this.record(request, generation);
+      return generation;
+    } catch (error) {
+      // A stream cut after it produced text would otherwise be retried from scratch, and an upstream
+      // that cuts at the same point every time turns one answer into a long silence.
+      const salvaged = salvagePartial(error);
+      if (!salvaged) throw error;
+      this.record(request, salvaged);
+      return salvaged;
+    }
   }
 
   private record(request: Request, generation: Generation): void {
