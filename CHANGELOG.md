@@ -1,3 +1,10 @@
+## 0.5.2
+
+- 修 Gemini 方言的 400:上游拒绝工具 schema 里的 additionalProperties,报 Invalid JSON payload received. Unknown name additionalProperties at tools[0].function_declarations[10].parameters。
+- 新增 geminiSchema():把每个工具的 parameters 收敛到 Gemini 接受的关键字集合,递归处理 properties、items、anyOf/oneOf/allOf/not;无法识别的字段丢弃而不是拒绝整个请求。
+- 触发条件是工具表里有 World 带 additionalProperties(内建的 web_search 就是),位置靠后的工具会报错,所以单个简单工具测不出来。
+- 测试 90 → 95 条,覆盖递归清洗、真实 web_search 字段保留、非法输入替换。
+
 ## 0.5.1
 
 - 流在上游被切断时,已经说出来的文字不再被丢弃。框架在错误里保存了快照(GenerationError.partial),但没有任何上层代码读它:一旦吐过文字就不再重试,于是内容直接作废、整轮重来。

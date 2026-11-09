@@ -132,8 +132,62 @@ export function buildGeminiBody(request: Request, options: GenerateOptions, medi
   if (spec.temperature !== undefined) generationConfig.temperature = spec.temperature;
   body.generationConfig = generationConfig;
   const tools = requestTools(request);
-  if (tools?.length) body.tools = [{ functionDeclarations: tools.map((tool) => ({ name: tool.name, description: tool.description, parameters: tool.parameters })) }];
+  if (tools?.length) {
+    body.tools = [{ functionDeclarations: tools.map((tool) => ({
+      name: tool.name,
+      description: tool.description,
+      parameters: geminiSchema(tool.parameters),
+    })) }];
+  }
   return body;
+}
+
+/**
+ * A JSON Schema reduced to the subset Gemini's `functionDeclarations` accepts.
+ *
+ * Gemini validates `parameters` against an OpenAPI-derived schema and rejects the whole request when it
+ * meets a keyword it does not model — `additionalProperties` alone fails every turn once one tool in
+ * the table carries it. Unknown keywords are dropped rather than rejected, which keeps a tool usable
+ * instead of removing the request.
+ */
+const SCHEMA_KEYWORDS = new Set([
+  'type', 'format', 'title', 'description', 'nullable', 'enum', 'const',
+  'items', 'properties', 'required', 'minItems', 'maxItems', 'uniqueItems',
+  'minimum', 'maximum', 'minLength', 'maxLength', 'pattern', 'default',
+  'anyOf', 'oneOf', 'allOf', 'not', 'example',
+]);
+
+export function geminiSchema(schema: unknown): Record<string, unknown> {
+  const value = schema as Record<string, unknown> | null | undefined;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return { type: 'object', properties: {} };
+  const out: Record<string, unknown> = {};
+  for (const [key, raw] of Object.entries(value)) {
+    if (!SCHEMA_KEYWORDS.has(key)) continue;
+    if (key === 'properties' && raw && typeof raw === 'object' && !Array.isArray(raw)) {
+      const properties: Record<string, unknown> = {};
+      for (const [name, child] of Object.entries(raw as Record<string, unknown>)) {
+        properties[name] = geminiSchema(child);
+      }
+      out.properties = properties;
+      continue;
+    }
+    if (key === 'items') {
+      out.items = Array.isArray(raw) ? raw.map((item) => geminiSchema(item)) : geminiSchema(raw);
+      continue;
+    }
+    if (key === 'anyOf' || key === 'oneOf' || key === 'allOf') {
+      if (Array.isArray(raw)) out[key] = raw.map((item) => geminiSchema(item));
+      continue;
+    }
+    if (key === 'not') {
+      out.not = geminiSchema(raw);
+      continue;
+    }
+    out[key] = raw;
+  }
+  // Gemini wants an object schema to state its properties; a bare `type: object` is rejected.
+  if (out.type === 'object' && out.properties === undefined) out.properties = {};
+  return out;
 }
 
 function parseArguments(raw: unknown): unknown {
