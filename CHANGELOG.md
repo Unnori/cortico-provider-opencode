@@ -1,3 +1,12 @@
+## 0.6.0
+
+- 修 Messages 方言从不流式:`buildResponseBody` 覆写后绕过了基类设置流标志的那一行,请求一直以非流式发出,于是框架拿到一整段 JSON 却按 SSE 解析,一个事件都收不到。表现是发送后这一轮立刻结束、没有回复。现在 `applyStreamFlags()` 在该覆写里被调用。
+- 修 Messages 方言的用量全是 null:`message_start` 携带的 token 计数被丢弃,`finish()` 补终止块时也不带用量。修复后实测 4/4 次请求都记录到用量(修复前 5/29),同一条回复的耗时中位从 3580ms 降到 2506ms。
+- 思考档位现在真正送达四个协议。原来只有 chat 与 responses 发送,anthropic 与 gemini 完全忽略这个设置。实测不设参数时上游仍会自行推理(chat 85 个推理 token、anthropic 141 个),所以「不思考」必须显式关闭。
+- anthropic 用 `thinking: { type: disabled }` 关、`{ type: adaptive }` 配 `output_config.effort` 开:Haiku 5.5 拒绝旧的 `enabled` + `budget_tokens` 写法。
+- gemini 用 `thinkingLevel`(LOW/MEDIUM/HIGH),它拒绝 `thinkingBudget`。这一系没有「不思考」档,最低是 LOW,所以 gemini 下的「不思考」是最低思考。
+- 测试 100 → 107 条。
+
 ## 0.5.2
 
 - 修 Gemini 方言的 400:上游拒绝工具 schema 里的 additionalProperties,报 Invalid JSON payload received. Unknown name additionalProperties at tools[0].function_declarations[10].parameters。

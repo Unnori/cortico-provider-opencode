@@ -20,6 +20,7 @@ import type { Protocol } from './address.ts';
 import { OpenCodeMessages } from './anthropic.ts';
 import { OpenCodeGemini } from './gemini.ts';
 import { identityHeaders, newSession } from './identity.ts';
+import { DEFAULT_EFFORT } from './options.ts';
 import type { LocalSpend } from './usage.ts';
 import { salvagePartial } from './salvage.ts';
 
@@ -83,7 +84,9 @@ export class OpenCodeChat extends OpenAIHttpClient {
       model: spec.model,
       messages: renderMessagesWithMedia(messages, this.media),
     };
-    if (spec.thinking && spec.reasoningEffort) body.reasoning_effort = spec.reasoningEffort;
+    // Leaving the field out does not mean off: the service then reasons on its own (85 reasoning tokens
+    // measured on a plain question). `none` is what stops it.
+    body.reasoning_effort = spec.thinking ? spec.reasoningEffort ?? DEFAULT_EFFORT : 'none';
     if (spec.temperature !== undefined) body.temperature = spec.temperature;
     if (spec.maxTokens !== undefined) body.max_tokens = spec.maxTokens;
     const mapped = mapTools(tools);

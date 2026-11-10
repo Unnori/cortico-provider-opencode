@@ -21,6 +21,7 @@ import type { CompatMediaOptions } from 'cortico/providers/transport/history.ts'
 import { renderMessagesWithMedia } from 'cortico/providers/transport/history.ts';
 import { nativeChatInput, requestSpec, requestTools } from 'cortico/providers/transport/native-input.ts';
 import { identityHeaders, newSession } from './identity.ts';
+import { DEFAULT_EFFORT } from './options.ts';
 
 /** The Messages API requires a limit; this one applies when the endpoint states none. */
 const DEFAULT_MAX_TOKENS = 8192;
@@ -95,6 +96,14 @@ export function buildMessagesBody(request: Request, options: GenerateOptions, me
   };
   if (system.length) body.system = system.join('\n\n');
   if (spec.temperature !== undefined) body.temperature = spec.temperature;
+  // Leaving thinking out does not mean off: the service then thinks on its own (141 reasoning tokens
+  // measured on a plain question). `disabled` is what actually stops it.
+  if (!spec.thinking) body.thinking = { type: 'disabled' };
+  else {
+    // Haiku 5.5 refuses `type: 'enabled'` with a budget and wants adaptive plus an effort level.
+    body.thinking = { type: 'adaptive' };
+    body.output_config = { effort: spec.reasoningEffort ?? DEFAULT_EFFORT };
+  }
   const tools = requestTools(request);
   if (tools?.length) body.tools = tools.map((tool) => ({ name: tool.name, description: tool.description, input_schema: tool.parameters }));
   return body;
@@ -145,6 +154,9 @@ export class MessagesAssembly implements ResponseAssembly {
     if (type === 'error') throw new StreamErrorEvent(JSON.stringify(event));
     if (type === 'message_start') {
       const message = event.message ?? {};
+      // `message_start` carries the token counts as the first estimate, and a stream that ends before
+      // `message_delta` never repeats them; keeping them here is what makes usage readable at all.
+      if (message.usage) this.usage = { ...(this.usage ?? {}), ...message.usage };
       this.inner.feed({ id: message.id, model: message.model, choices: [{ delta: {} }] }, emit);
       return;
     }
@@ -200,7 +212,11 @@ export class MessagesAssembly implements ResponseAssembly {
   finish(emit: (event: StreamEvent) => void): Response {
     if (!this.closed) {
       this.closed = true;
-      this.inner.feed({ choices: [{ delta: {}, finish_reason: STOP_REASONS[this.stopReason] ?? 'stop' }] }, emit);
+      const usage = chatUsage(this.usage);
+      this.inner.feed({
+        ...(usage ? { usage } : {}),
+        choices: [{ delta: {}, finish_reason: STOP_REASONS[this.stopReason] ?? 'stop' }],
+      }, emit);
     }
     return this.inner.finish(emit);
   }
@@ -259,7 +275,11 @@ export class OpenCodeMessages extends OpenAIHttpClient {
 
   protected override buildResponseBody(request: Request, options: GenerateOptions): Record<string, unknown> {
     this.session = options.sessionId ?? '';
-    return buildMessagesBody(request, options, this.media);
+    const body = buildMessagesBody(request, options, this.media);
+    // The base builder is unreachable here, and the stream flag is set by it, so this method must set
+    // the flag itself or every request goes out unary and the assembly never sees an SSE frame.
+    if (options.onEvent) this.applyStreamFlags(body);
+    return body;
   }
 
   /** The Chat body builder is unreachable here: `buildResponseBody` is overridden whole. */

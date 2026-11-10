@@ -20,9 +20,17 @@ import { StreamErrorEvent } from 'cortico/providers/transport/errors.ts';
 import { renderMessagesWithMedia, type CompatMediaOptions } from 'cortico/providers/transport/history.ts';
 import { nativeChatInput, requestSpec, requestTools } from 'cortico/providers/transport/native-input.ts';
 import { identityHeaders, newSession } from './identity.ts';
+import { DEFAULT_EFFORT, MINIMUM_GEMINI_LEVEL } from './options.ts';
 import { SignatureStore } from './signatures.ts';
 
 type Shape = Record<string, any>;
+
+/** The level enum Gemini accepts. A value outside it is refused outright, so anything unknown is medium. */
+const GEMINI_LEVELS: Readonly<Record<string, string>> = { low: 'LOW', medium: 'MEDIUM', high: 'HIGH' };
+
+function geminiLevel(effort: string | undefined): string {
+  return GEMINI_LEVELS[(effort ?? DEFAULT_EFFORT).toLowerCase()] ?? GEMINI_LEVELS[DEFAULT_EFFORT]!;
+}
 type Part = Record<string, unknown>;
 
 const DEFAULT_MAX_TOKENS = 8192;
@@ -130,6 +138,11 @@ export function buildGeminiBody(request: Request, options: GenerateOptions, medi
   if (system.length) body.systemInstruction = { parts: [{ text: system.join('\n\n') }] };
   const generationConfig: Record<string, unknown> = { maxOutputTokens: spec.maxTokens ?? DEFAULT_MAX_TOKENS };
   if (spec.temperature !== undefined) generationConfig.temperature = spec.temperature;
+  // This model family takes a level, not a budget, and has no level that means "no thinking": the
+  // lowest one is the closest a request can get. Levels are refused if spelled anything but the enum.
+  generationConfig.thinkingConfig = {
+    thinkingLevel: spec.thinking ? geminiLevel(spec.reasoningEffort) : MINIMUM_GEMINI_LEVEL,
+  };
   body.generationConfig = generationConfig;
   const tools = requestTools(request);
   if (tools?.length) {

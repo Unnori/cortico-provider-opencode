@@ -92,7 +92,6 @@ CORTICO_KEY_KAI;CORTICO_KEY_KAI_2
 - `gemini`:`POST <baseUrl>/models/<模型>:generateContent`,流式走 `:streamGenerateContent?alt=sse`。模型名与调用方法都在路径里,所以路径按请求设置。密钥同时以 `Authorization: Bearer` 与 `x-goog-api-key` 发出,两边各读自己认的那个。
 
 Console 把每个文本模型翻译到被问的那一套,所以四种协议都覆盖全部文本模型;换协议只改请求形状。
-Messages 方言不发送思维链:Messages 把思考写成 token 预算,而 Console 怎么把 OpenAI 风格的 effort 映到预算没有文档。
 
 Gemini 要求 `contents` 以 **user 轮**结尾,而框架的历史在「一轮以助手消息收尾」或「被事件推送打断」时会停在 model 轮上,于是报 `Requests ending with a model turn are not supported`。翻译器发现末轮是 model 就补一条极短的 user 轮(`(继续。)`),已经以 user 结尾的历史不动。`src/signatures.ts` 则负责签名:Gemini 3 起要求每个 `functionCall` 回传时带上模型给它的 `thoughtSignature`,而框架的历史只存 `{ id, type, function }`,放不下这个字段。所以 `src/signatures.ts` 按 call id 记住签名、回放时按 id 取回;进程重启或遇到更早的历史时,用文档里的 `skip_thought_signature_validator` 兜底放行——不带签名必然是 400,带哨兵则照常作答。
 
@@ -101,6 +100,22 @@ Gemini 要求 `contents` 以 **user 轮**结尾,而框架的历史在「一轮�
 ## 思考档位与默认值
 
 端点页的「推理强度」有四档:不思考 / 快 / 标准 / 深入。后三档发的 effort 是 `low` / `medium` / `high`,即网关与 models.dev 列出的那组取值。
+
+每个协议把档位翻成自己的写法:
+
+| 协议 | 不思考 | 快 / 标准 / 深入 |
+|---|---|---|
+| `chat` | `reasoning_effort: none` | `reasoning_effort: low/medium/high` |
+| `responses` | `reasoning.effort: none` | 同上的档位 |
+| `anthropic` | `thinking: { type: disabled }` | `thinking: { type: adaptive }` + `output_config.effort` |
+| `gemini` | `thinkingLevel: LOW` | `thinkingLevel: LOW/MEDIUM/HIGH` |
+
+**不发字段不等于不思考**:实测不设参数时,chat 仍用 85 个推理 token、anthropic 用 141 个。所以「不思考」是显式关掉的。
+
+两处上游限制决定了上表的写法:
+
+- Anthropic 的 Haiku 5.5 拒绝 `{ type: 'enabled', budget_tokens }`,要求 `adaptive` 配 `output_config.effort`。
+- Gemini 这一系拒绝 `thinkingBudget`,只认 `thinkingLevel`,而且**没有「不思考」这一档**:最低是 `LOW`。所以 gemini 协议下的「不思考」是最低思考,不是真关掉。
 
 选中模型后,`normalize()` 会补上 OpenCode 文档里的默认:`temperature = 1`、`maxTokens = 8192`。只填空着的字段,运营者填过的值不会被覆盖。输出上限在端点页可以改——8192 是默认,不是上限。
 

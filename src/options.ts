@@ -21,6 +21,12 @@ export const DEFAULT_MAX_TOKENS = 8192;
 /** Chat is the faster path here: most Go models are Chat-native, so Responses has to be translated. */
 export const DEFAULT_PROTOCOL: Protocol = 'chat';
 
+/** The effort sent when thinking is on and the endpoint states no level. */
+export const DEFAULT_EFFORT = 'medium';
+
+/** The lowest level Gemini accepts. It is the closest a Gemini request gets to "no thinking". */
+export const MINIMUM_GEMINI_LEVEL = 'LOW';
+
 export interface OpenCodeOptions {
   /** Unset: chat. */
   protocol?: Protocol;
