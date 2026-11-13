@@ -4,3 +4,4 @@ node_modules/
 
 # dist/ is committed on purpose: the panel bundle is loaded from the installed package without a build
 # step, so a clone must contain dist/webui.js.
+scratch/
