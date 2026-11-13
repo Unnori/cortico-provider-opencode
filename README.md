@@ -47,8 +47,19 @@ Coopanion 里:高级模式 →「扩展」→ 填包名 `cortico-provider-openco
 
 `options.billing` 只有两个值:
 
-- `go`(默认):走 Go 或 Go Plus 订阅的额度。地址带 `/go` 段。
+- `go`:走 Go / Go Plus 订阅的额度。地址带 `/go` 段。
 - `balance`:走 Console 余额,按次计费。地址不带 `/go`。
+
+**留空时按地址判断**:地址里写了 `/go` 就是 Go,写了家族路径却没有 `/go`(`/openai/v1`、`/anthropic/v1`、`/google/v1beta`、`/v1/models`)就是按量余额;只有光秃秃的 `/inference` 才用默认值 Go。显式选中某一项时以选项为准。
+
+两套账户的模型清单不同,这决定端点页能选到什么:
+
+| 账户 | 模型数 | 例子 |
+|---|---|---|
+| Go | 30 | `deepseek-v4.1-flash`、`gemini-4-argon`、`kimi-k3.1-pro` |
+| 按量余额 | 12 | `claude-opus-5-5`、`gpt-6.1-sol`、`gemini-4-carbon` |
+
+**Opus 这类高级模型只在按量余额里。** 把余额的模型名发到 Go 路径会得到 `400 Model is unavailable`,不是权限问题,是那个账户没有这条路由。
 
 额度窗口只对 Go 有;`balance` 端点没有额度可看,面板会直接说这件事。
 

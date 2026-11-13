@@ -4,7 +4,7 @@
  * variable names this endpoint may use with one after another.
  */
 import type { LLMProviderEntry } from 'cortico/core/types.ts';
-import type { Protocol } from './address.ts';
+import { billingHintOf, type Protocol } from './address.ts';
 import type { Billing } from './pricing.ts';
 
 export const BILLING_OPTIONS: readonly Billing[] = ['go', 'balance'];
@@ -43,7 +43,12 @@ export const optionsOf = (entry: LLMProviderEntry): OpenCodeOptions => (entry.op
 
 export const protocolOf = (entry: LLMProviderEntry): Protocol => optionsOf(entry).protocol ?? DEFAULT_PROTOCOL;
 
-export const billingOf = (entry: LLMProviderEntry): Billing => optionsOf(entry).billing ?? DEFAULT_BILLING;
+/**
+ * The account this endpoint bills. The option wins when set; an unset option follows the address, so a
+ * pasted balance URL does not silently charge the subscription; a bare gateway root keeps the default.
+ */
+export const billingOf = (entry: LLMProviderEntry): Billing =>
+  optionsOf(entry).billing ?? billingHintOf(entry.baseUrl) ?? DEFAULT_BILLING;
 
 /**
  * The key names this endpoint may use, in the order it must try them. `entry.secret` stays first so a

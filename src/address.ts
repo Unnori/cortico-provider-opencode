@@ -51,3 +51,19 @@ export function modelListUrl(gateway: Gateway, billing: Billing): string {
 export function usageUrl(gateway: Gateway): string {
   return `${gateway.root}/go/v1/usage`;
 }
+
+/**
+ * Which account a pasted address names, or null when the address is only the gateway root and says
+ * nothing about the account.
+ *
+ * Every path under `/inference` reduces to the same root in `parseGateway`, so without this an operator
+ * who pastes a balance address still reaches the subscription and sees its models.
+ */
+export function billingHintOf(baseUrl: string): Billing | null {
+  if (!parseGateway(baseUrl)) return null;
+  const path = baseUrl.slice(baseUrl.indexOf(MARKER));
+  if (/(^|\/)go(\/|$)/.test(path)) return 'go';
+  // A family path without `/go` is the balance form of the same gateway.
+  if (/\/(openai\/v1|anthropic\/v1|google\/v1beta|v1\/models)(\/|$|\?)/.test(path)) return 'balance';
+  return null;
+}
