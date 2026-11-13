@@ -119,11 +119,18 @@ export const OPENCODE = {
     const protocol = protocolOf(entry);
     const ledger = new SpendLedger();
     const session = newSession();
-    const catalog = createCatalog({ baseUrl: entry.baseUrl, billing, cacheFile: join(host.stateDir, 'models.json') });
     const currentEntry = () => host.currentEntry?.() ?? entry;
     // The names are read from the saved entry, the values through `host.secret`, so an operator can add
     // a second key without this instance being rebuilt.
     const cursor = createKeyCursor({ names: keyNamesOf(entry), read: (keyName) => host.secret(keyName) });
+    const catalog = createCatalog({
+      baseUrl: entry.baseUrl,
+      billing,
+      cacheFile: join(host.stateDir, 'models.json'),
+      // Read per request: the gateway filters its listing by account, and a key saved after this
+      // instance was built must still narrow the list.
+      apiKey: () => cursor.current()?.value ?? (entry.secret ? host.secret(entry.secret) : undefined),
+    });
     const apiKey = entry.secret ? host.secret(entry.secret) : undefined;
     const provider = new OpenCodeProvider({
       baseUrl: gateway ? baseUrlOf(gateway, billing, protocol) : entry.baseUrl,

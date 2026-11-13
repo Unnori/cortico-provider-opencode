@@ -10,6 +10,7 @@
 import { readFileSync, writeFileSync } from 'node:fs';
 import type { ListedModel } from 'cortico/providers/base.ts';
 import { modelListUrl, parseGateway } from './address.ts';
+import { identityHeaders } from './identity.ts';
 import type { Billing } from './pricing.ts';
 
 /** What the catalogue states about one model. */
@@ -25,6 +26,11 @@ export interface CatalogOptions {
   billing: Billing;
   /** Where the matched subset is cached, inside the endpoint directory. */
   cacheFile: string;
+  /**
+   * The key for the list request. The gateway filters this listing by account: without a key it
+   * answers with the whole catalog, which offers models the account cannot call.
+   */
+  apiKey?: () => string | undefined;
 }
 
 export interface Catalog {
@@ -43,8 +49,15 @@ export function modelsUrl(baseUrl: string, billing: Billing): string {
   return gateway ? modelListUrl(gateway, billing) : `${baseUrl.replace(/\/+$/, '')}/models`;
 }
 
-async function gatewayIds(baseUrl: string, billing: Billing): Promise<string[]> {
-  const response = await fetch(modelsUrl(baseUrl, billing), { headers: { Accept: 'application/json' } });
+async function gatewayIds(opts: CatalogOptions): Promise<string[]> {
+  const key = opts.apiKey?.();
+  const response = await fetch(modelsUrl(opts.baseUrl, opts.billing), {
+    headers: {
+      Accept: 'application/json',
+      ...(key ? { Authorization: `Bearer ${key}` } : {}),
+      ...identityHeaders(''),
+    },
+  });
   if (!response.ok) throw new Error(`OpenCode model list: HTTP ${response.status}`);
   const body = (await response.json()) as { data?: { id?: unknown }[] };
   const rows = Array.isArray(body.data) ? body.data : [];
@@ -118,7 +131,7 @@ export function createCatalog(opts: CatalogOptions): Catalog {
 
   return {
     async listModels(): Promise<ListedModel[]> {
-      const ids = await gatewayIds(opts.baseUrl, opts.billing);
+      const ids = await gatewayIds(opts);
       try {
         if (!Object.keys(known).length || ids.some((id) => !known[id])) {
           Object.assign(known, await fetchFacts(ids));
