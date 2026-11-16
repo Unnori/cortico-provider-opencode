@@ -22,6 +22,7 @@ import { renderMessagesWithMedia } from 'cortico/providers/transport/history.ts'
 import { nativeChatInput, requestSpec, requestTools } from 'cortico/providers/transport/native-input.ts';
 import { identityHeaders, newSession } from './identity.ts';
 import { DEFAULT_EFFORT } from './options.ts';
+import { chatImageCount, mediaForRequest } from './images.ts';
 
 /** The Messages API requires a limit; this one applies when the endpoint states none. */
 const DEFAULT_MAX_TOKENS = 8192;
@@ -60,7 +61,8 @@ function parseArguments(raw: unknown): unknown {
 
 export function buildMessagesBody(request: Request, options: GenerateOptions, media?: CompatMediaOptions): Record<string, unknown> {
   const spec = requestSpec(request, options);
-  const rendered = renderMessagesWithMedia(nativeChatInput(request, options), media) as Rendered[];
+  const input = nativeChatInput(request, options);
+  const rendered = renderMessagesWithMedia(input, mediaForRequest(media, chatImageCount(input))) as Rendered[];
   const system: string[] = [];
   const messages: Array<{ role: 'user' | 'assistant'; content: Block[] }> = [];
   const push = (role: 'user' | 'assistant', blocks: Block[]): void => {
@@ -135,10 +137,15 @@ function chatUsage(raw: Rendered | null): Record<string, unknown> | undefined {
   };
 }
 
+/** Empty tool blocks still consume memory even when they consume no character budget. */
+export const MAX_MESSAGES_TOOL_CALLS = 4096;
+
 /** Messages events translated into the Chat chunks `ChatResponseAssembly` validates. */
 export class MessagesAssembly implements ResponseAssembly {
   private readonly inner: ChatResponseAssembly;
   private readonly tools = new Map<number, { id: string; name: string; arguments: string }>();
+  private toolCharacters = 0;
+  private readonly maxToolCharacters: number;
   private stopReason = 'end_turn';
   private usage: Rendered | null = null;
   /** Set once the terminal chunk has been fed, so `finish` never feeds a second one. */
@@ -146,6 +153,15 @@ export class MessagesAssembly implements ResponseAssembly {
 
   constructor(request: Request) {
     this.inner = new ChatResponseAssembly(request);
+    // Tool identities and arguments remain private until the block closes.
+    this.maxToolCharacters = (request.max_output_tokens ?? 32768) * 12;
+  }
+
+  private countToolCharacters(characters: number): void {
+    if (characters > this.maxToolCharacters - this.toolCharacters) {
+      throw new StreamErrorEvent('Messages tool data exceeded the output character limit');
+    }
+    this.toolCharacters += characters;
   }
 
   feed(payload: unknown, emit: (event: StreamEvent) => void): void {
@@ -163,7 +179,13 @@ export class MessagesAssembly implements ResponseAssembly {
     if (type === 'content_block_start') {
       const block = event.content_block ?? {};
       if (block.type === 'tool_use' && Number.isInteger(event.index)) {
-        this.tools.set(event.index, { id: String(block.id ?? ''), name: String(block.name ?? ''), arguments: '' });
+        if (!this.tools.has(event.index) && this.tools.size >= MAX_MESSAGES_TOOL_CALLS) {
+          throw new StreamErrorEvent('Messages response exceeded the tool block limit');
+        }
+        const id = String(block.id ?? '');
+        const name = String(block.name ?? '');
+        this.countToolCharacters(id.length + name.length);
+        this.tools.set(event.index, { id, name, arguments: '' });
       }
       return;
     }
@@ -175,7 +197,11 @@ export class MessagesAssembly implements ResponseAssembly {
         this.inner.feed({ choices: [{ delta: { reasoning_content: delta.thinking } }] }, emit);
       } else if (delta.type === 'input_json_delta') {
         const tool = this.tools.get(event.index);
-        if (tool) tool.arguments += String(delta.partial_json ?? '');
+        if (tool) {
+          const fragment = String(delta.partial_json ?? '');
+          this.countToolCharacters(fragment.length);
+          tool.arguments += fragment;
+        }
       }
       return;
     }

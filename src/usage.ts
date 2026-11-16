@@ -11,6 +11,7 @@
 import { usageUrl, type Gateway } from './address.ts';
 import { WINDOW_SHARE, monthlyLimit, type UsageWindow } from './pricing.ts';
 import { identityHeaders } from './identity.ts';
+import { auxiliarySignal, parseJsonText, readLimitedText } from './http.ts';
 
 export interface UsageWindowState {
   status: 'ok' | 'rate-limited';
@@ -73,20 +74,24 @@ export async function readUsage(
   const variants = preferred ? AUTH_VARIANTS.filter(([id]) => id === preferred) : AUTH_VARIANTS;
   const tried: string[] = [];
   let last: Error | null = null;
+  const requestSignal = auxiliarySignal(signal);
   for (const [id, header] of variants) {
     const response = await fetch(url, {
       headers: { Accept: 'application/json', ...identityHeaders(session), ...(apiKey ? header(apiKey) : {}) },
-      ...(signal ? { signal } : {}),
+      signal: requestSignal,
+      redirect: 'error',
     });
-    const text = await response.text();
+    const text = await readLimitedText(response, MAX_BYTES, 'OpenCode usage');
     if (response.ok) {
-      if (text.length > MAX_BYTES) throw new Error('OpenCode usage: response too large');
+      const usage = parseUsage(parseJsonText(text, 'OpenCode usage'));
       if (apiKey) accepted.set(gateway.root, id);
-      return parseUsage(JSON.parse(text));
+      return usage;
     }
     // The body says why, and whether a key went out at all separates "we sent nothing" from "the key
     // was refused" — inference and the usage endpoint do not always agree on a key.
-    const detail = text.trim().slice(0, 200);
+    // Some gateways echo the rejected credential. Redact before truncating so a key straddling the
+    // diagnostic limit cannot leak its prefix into the panel or a caller's log.
+    const detail = (apiKey ? text.replaceAll(apiKey, '[redacted]') : text).trim().slice(0, 200);
     const auth = apiKey ? `key sent via ${id}, ${apiKey.length} chars` : 'no key';
     last = new Error(`OpenCode usage: HTTP ${response.status} [${auth}]${detail ? ` — ${detail}` : ''}`);
     tried.push(`${id}: ${response.status}`);

@@ -35,6 +35,7 @@ function producedText(partial: PartialResponse): string {
  */
 export function salvagePartial(error: unknown): Generation | null {
   if (!(error instanceof GenerationError)) return null;
+  if (error.attempts.some(attempt => attempt.outcome === 'aborted')) return null;
   if (!error.partial || !producedText(error.partial)) return null;
   return {
     response: { ...error.partial, status: 'incomplete', incomplete_details: { reason: 'stream_interrupted' } },

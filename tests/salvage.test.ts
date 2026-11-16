@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { GenerationError } from 'cortico/core/generation.ts';
+import { OpenCodeProvider } from '../src/native.ts';
 import { salvagePartial } from '../src/salvage.ts';
 
 const origin = { instance: 'Opencode', module: 'opencode', model: 'gemini-4-argon', compatibilityDomain: 'x' };
@@ -49,5 +50,40 @@ describe('salvaging a cut stream', () => {
 
   it('does not salvage an empty text part', () => {
     expect(salvagePartial(errorWith(partialWith('')))).toBeNull();
+  });
+
+  it('preserves cancellation when an aborted attempt already produced text', () => {
+    const error = new GenerationError('cancelled', [{ outcome: 'aborted' }] as never,
+      partialWith('partial'), origin as never);
+    expect(salvagePartial(error)).toBeNull();
+  });
+
+  it('rejects a cancelled provider stream instead of returning its partial text', async () => {
+    const aborter = new AbortController();
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (_url, init) => new Response(new ReadableStream({
+      start(controller) {
+        const chunk = { choices: [{ delta: { content: 'partial response' } }] };
+        controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(chunk)}\n\n`));
+        init!.signal!.addEventListener('abort', () => controller.error(init!.signal!.reason), { once: true });
+      },
+    }), { headers: { 'Content-Type': 'text/event-stream' } });
+    try {
+      const provider = new OpenCodeProvider({
+        protocol: 'chat', baseUrl: 'https://example.invalid', keepThinking: () => false,
+      });
+      await expect(provider.respond({ model: 'fixture', input: [] } as never, {
+        signal: aborter.signal,
+        onEvent: event => {
+          if (event.type === 'response.output_text.delta') aborter.abort(new Error('user cancelled'));
+        },
+      })).rejects.toMatchObject({
+        name: 'GenerationError',
+        message: expect.stringContaining('user cancelled'),
+        attempts: [expect.objectContaining({ outcome: 'aborted' })],
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 });

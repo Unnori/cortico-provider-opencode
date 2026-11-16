@@ -16,7 +16,7 @@ import { isContextOverflow } from 'cortico/providers/transport/errors.ts';
 import { baseUrlOf, parseGateway, PROTOCOLS, type Protocol } from './address.ts';
 import { BILLING_OPTIONS, billingOf, DEFAULT_MAX_TOKENS, DEFAULT_TEMPERATURE, keyNamesOf, optionsOf, protocolOf } from './options.ts';
 import { createKeyCursor } from './rotation.ts';
-import { guardedMedia } from './images.ts';
+import { guardedMedia, supportsImageMime } from './images.ts';
 import { createCatalog } from './catalog.ts';
 import { OpenCodeProvider, SpendLedger } from './native.ts';
 import { prices, type Billing, type UsageWindow } from './pricing.ts';
@@ -109,7 +109,7 @@ export const OPENCODE = {
     if (protocol !== undefined && !PROTOCOLS.includes(protocol)) throw new Error(t.badProtocol(PROTOCOLS.join(' / ')));
     if (billing !== undefined && !BILLING_OPTIONS.includes(billing)) throw new Error(t.badBilling(BILLING_OPTIONS.join(' / ')));
   },
-  accepts: (entry: LLMProviderEntry, _spec, mime: string) => entry.multimodal === true && mime.startsWith('image/'),
+  accepts: (entry: LLMProviderEntry, _spec, mime: string) => entry.multimodal === true && supportsImageMime(mime),
   prices: (entry: LLMProviderEntry, _request, at) => prices(billingOf(entry), at.startedAt),
   contextOverflow: isContextOverflow,
   webUi: opencodeWebUi,
@@ -142,8 +142,9 @@ export const OPENCODE = {
       media: guardedMedia({
         enabled: () => currentEntry().multimodal === true,
         read: host.readBlob,
-        onDropped: ({ handle, size, limit, count }) => host.log.warn('opencode: image left out of the request', {
-          handle, width: size.width, height: size.height, limit, count,
+        onDropped: (info) => host.log.warn('opencode: image left out of the request', {
+          handle: info.handle, reason: info.reason, mime: info.mime,
+          ...(info.reason === 'dimensions' ? { width: info.size.width, height: info.size.height, limit: info.limit, count: info.count } : {}),
         }),
       }),
       keepThinking: host.keepThinking,

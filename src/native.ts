@@ -12,7 +12,7 @@ import { nullLogger } from 'cortico/core/util.ts';
 import type { GenerateOptions, Generation } from 'cortico/core/generation.ts';
 import type { Request } from 'cortico/protocol/open-responses/index.ts';
 import { BaseProvider } from 'cortico/providers/base.ts';
-import { ResponsesProvider, type ResponsesProviderOptions } from 'cortico/providers/openai-responses-compat/native.ts';
+import { buildResponsesBody, ResponsesProvider, type ResponsesProviderOptions } from 'cortico/providers/openai-responses-compat/native.ts';
 import { OpenAIHttpClient } from 'cortico/providers/transport/chat.ts';
 import { mapTools, renderMessagesWithMedia, type CompatMediaOptions } from 'cortico/providers/transport/history.ts';
 import type { NativeChatMessage } from 'cortico/providers/transport/native-types.ts';
@@ -23,6 +23,7 @@ import { identityHeaders, newSession } from './identity.ts';
 import { DEFAULT_EFFORT } from './options.ts';
 import type { LocalSpend } from './usage.ts';
 import { salvagePartial } from './salvage.ts';
+import { chatImageCount, mediaForRequest, requestImageCount, sanitizeNativeImages } from './images.ts';
 
 export { USER_AGENT } from './identity.ts';
 export { OpenCodeMessages, OpenCodeGemini };
@@ -82,7 +83,7 @@ export class OpenCodeChat extends OpenAIHttpClient {
     this.session = sessionId ?? '';
     const body: Record<string, unknown> = {
       model: spec.model,
-      messages: renderMessagesWithMedia(messages, this.media),
+      messages: renderMessagesWithMedia(messages, mediaForRequest(this.media, chatImageCount(messages))),
     };
     // Leaving the field out does not mean off: the service then reasons on its own (85 reasoning tokens
     // measured on a plain question). `none` is what stops it.
@@ -110,9 +111,11 @@ export class OpenCodeResponses extends ResponsesProvider {
   private readonly fallback = newSession();
   private readonly apiKeyOf?: () => string | undefined;
   private readonly onKeyRefused?: () => void;
+  private readonly responseOptions: ResponsesProviderOptions;
 
   constructor(opts: ResponsesProviderOptions & { apiKeyOf?: () => string | undefined; onKeyRefused?: () => void }) {
     super(opts);
+    this.responseOptions = opts;
     this.apiKeyOf = opts.apiKeyOf;
     this.onKeyRefused = opts.onKeyRefused;
   }
@@ -130,7 +133,12 @@ export class OpenCodeResponses extends ResponsesProvider {
 
   protected override buildResponseBody(request: Request, options: GenerateOptions): Record<string, unknown> {
     this.session = options.sessionId ?? '';
-    return super.buildResponseBody(request, options);
+    const opts = this.responseOptions;
+    return buildResponsesBody(request, options, {
+      media: mediaForRequest(opts.media, requestImageCount(request, options)),
+      keepThinking: opts.keepThinking, reasoningReplay: opts.reasoningReplay,
+      syntheticReasoningText: opts.syntheticReasoningText, sendSyntheticReasoning: opts.sendSyntheticReasoning,
+    }, opts.extraBody);
   }
 
   protected override headers(): Record<string, string> {
@@ -180,10 +188,12 @@ export interface ProviderOptions extends ClientOptions {
 export class OpenCodeProvider extends BaseProvider {
   private readonly client: OpenCodeChat | OpenCodeResponses | OpenCodeMessages | OpenCodeGemini;
   private readonly ledger?: SpendLedger;
+  private readonly media?: CompatMediaOptions;
 
   constructor(opts: ProviderOptions) {
     super();
     this.ledger = opts.ledger;
+    this.media = opts.media;
     const shared = {
       baseUrl: opts.baseUrl,
       apiKey: opts.apiKey,
@@ -202,11 +212,13 @@ export class OpenCodeProvider extends BaseProvider {
   }
 
   override async respond(request: Request, options: GenerateOptions = {}): Promise<Generation> {
+    options = sanitizeNativeImages(request, options, this.media);
     try {
       const generation = await this.client.respond(request, options);
       this.record(request, generation);
       return generation;
     } catch (error) {
+      if (options.signal?.aborted) throw error;
       // A stream cut after it produced text would otherwise be retried from scratch, and an upstream
       // that cuts at the same point every time turns one answer into a long silence.
       const salvaged = salvagePartial(error);

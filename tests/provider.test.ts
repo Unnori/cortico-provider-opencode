@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -6,6 +6,9 @@ import { dryMountProvider } from 'cortico/extensions/dry-mount.ts';
 import type { LLMProviderEntry } from 'cortico/core/types.ts';
 import type { ProviderHost } from 'cortico/providers/base.ts';
 import type { ProviderWebUiHost } from 'cortico/providers/webui/types.ts';
+import type { GenerateOptions } from 'cortico/core/generation.ts';
+import type { Request } from 'cortico/protocol/open-responses/index.ts';
+import { message } from 'cortico/protocol/open-responses/context.ts';
 import OPENCODE, { BILLING_OPTIONS, DEFAULT_BILLING, billingOf, protocolOf } from '../src/index.ts';
 import { DEFAULT_PROTOCOL, keyNamesOf } from '../src/options.ts';
 import { createKeyCursor } from '../src/rotation.ts';
@@ -18,7 +21,8 @@ import { buildMessagesBody, MessagesAssembly } from '../src/anthropic.ts';
 import { buildGeminiBody, GeminiAssembly, parseGeminiResponse } from '../src/gemini.ts';
 import { SignatureStore } from '../src/signatures.ts';
 import { opencodeWebUi, ALLOWANCE_PANEL } from '../src/webui/server.ts';
-import { OpenCodeResponses, SpendLedger } from '../src/native.ts';
+import { OpenCodeChat, OpenCodeResponses, SpendLedger } from '../src/native.ts';
+import { guardedMedia, type DroppedImage } from '../src/images.ts';
 import { createCatalog, pickFacts } from '../src/catalog.ts';
 import { readUsage } from '../src/usage.ts';
 import { createServer } from 'node:http';
@@ -44,6 +48,16 @@ const host = (): ProviderHost => ({
 } as unknown as ProviderHost);
 
 describe('OpenCode provider', () => {
+  it('accepts only PNG, JPEG and WebP when multimodal input is enabled', () => {
+    const spec = { model: 'test', thinking: false };
+    for (const mime of ['image/png', 'image/jpeg', 'image/webp']) {
+      expect(OPENCODE.accepts(entry({ multimodal: true }), spec, mime)).toBe(true);
+      expect(OPENCODE.accepts(entry({ multimodal: false }), spec, mime)).toBe(false);
+    }
+    for (const mime of ['image/gif', 'image/svg+xml', 'image/bmp', 'image/avif', 'text/plain']) {
+      expect(OPENCODE.accepts(entry({ multimodal: true }), spec, mime)).toBe(false);
+    }
+  });
   it('dry mount reports no failures: the loader accepts it', () => {
     expect(dryMountProvider(OPENCODE, { scratchDir }).failures).toEqual([]);
   });
@@ -95,6 +109,113 @@ describe('OpenCode provider', () => {
     const kept = OPENCODE.normalize?.(entry({ spec: { model: 'glm-5.3', thinking: false, temperature: 0.2, maxTokens: 2048 } }));
     expect(kept?.spec?.temperature).toBe(0.2);
     expect(kept?.spec?.maxTokens).toBe(2048);
+  });
+});
+
+describe('multimodal history replay', () => {
+  class InspectableChat extends OpenCodeChat {
+    body(request: Request, options: GenerateOptions): Record<string, unknown> { return this.buildResponseBody(request, options); }
+  }
+  class InspectableResponses extends OpenCodeResponses {
+    body(request: Request, options: GenerateOptions): Record<string, unknown> { return this.buildResponseBody(request, options); }
+  }
+
+  function bodyBuilder(protocol: 'chat' | 'responses' | 'anthropic' | 'gemini', media: ReturnType<typeof guardedMedia>) {
+    const clientOptions = { baseUrl: 'https://example.invalid/v1', media };
+    const chat = new InspectableChat(clientOptions);
+    const responses = new InspectableResponses(clientOptions);
+    return (request: Request, options: GenerateOptions): Record<string, unknown> => {
+      if (protocol === 'chat') return chat.body(request, options);
+      if (protocol === 'responses') return responses.body(request, options);
+      if (protocol === 'anthropic') return buildMessagesBody(request, options, media);
+      return buildGeminiBody(request, options, media);
+    };
+  }
+
+  it.each(['chat', 'responses', 'anthropic', 'gemini'] as const)('keeps %s requests usable when history contains GIFs, including mislabeled ones', (protocol) => {
+    const gif = Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64');
+    const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a6ioAAAAASUVORK5CYII=', 'base64');
+    const blobs = new Map([['gif', gif], ['mislabeled', gif], ['png', png]]);
+    const dropped: DroppedImage[] = [];
+    const media = guardedMedia({ enabled: () => true, read: (handle) => blobs.get(handle) ?? null, onDropped: (info) => dropped.push(info) });
+    const build = bodyBuilder(protocol, media);
+    const history = [message('user', 'saved GIF fallback; mislabeled GIF fallback; valid PNG fallback', { blobs: [
+      { handle: 'gif', mime: 'image/gif', fallbackText: 'saved GIF fallback' },
+      { handle: 'mislabeled', mime: 'image/png', fallbackText: 'mislabeled GIF fallback' },
+      { handle: 'png', mime: 'image/png', fallbackText: 'valid PNG fallback' },
+    ] })];
+    const original = structuredClone(history[0]);
+    for (let turn = 0; turn < 3; turn++) {
+      history.push(message('user', `follow-up ${turn}`));
+      const body = JSON.stringify(build({ model: 'test', input: [] }, {
+        nativeSpec: { model: 'test', thinking: false }, context: history,
+      }));
+      expect(body).toContain('saved GIF fallback');
+      expect(body).toContain('mislabeled GIF fallback');
+      expect(body).toContain(`follow-up ${turn}`);
+      expect(body).toContain(png.toString('base64'));
+      expect(body).not.toContain(gif.toString('base64'));
+      expect(body).not.toContain('image/gif');
+    }
+    expect(history[0]).toEqual(original);
+    expect(dropped).toHaveLength(6);
+    expect(dropped.every((info) => info.reason === 'unsupported-format' && info.mime === 'image/gif')).toBe(true);
+  });
+
+  it.each(['chat', 'responses', 'anthropic', 'gemini'] as const)('applies %s crowded limits to the first image, counts duplicate handles and resets per request', (protocol) => {
+    const small = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a6ioAAAAASUVORK5CYII=', 'base64');
+    const large = Buffer.from(small);
+    large.writeUInt32BE(8192, 16);
+    const media = guardedMedia({ enabled: () => true, read: (handle) => handle === 'large' ? large : small });
+    const build = bodyBuilder(protocol, media);
+    const blobs = [
+      { handle: 'large', mime: 'image/png', fallbackText: 'large fallback' },
+      ...Array.from({ length: 14 }, () => ({ handle: 'same-small', mime: 'image/png', fallbackText: 'small' })),
+    ];
+    const options = { nativeSpec: { model: 'test', thinking: false }, context: [message('user', 'large fallback', { blobs })] };
+    const crowded = JSON.stringify(build({ model: 'test', input: [] }, options));
+    expect(crowded).not.toContain(large.toString('base64'));
+    expect(crowded).toContain(small.toString('base64'));
+    expect(crowded).toContain('large fallback');
+    const next = JSON.stringify(build({ model: 'test', input: [] }, {
+      ...options, context: [message('user', 'one image', { blobs: [blobs[0]] })],
+    }));
+    expect(next).toContain(large.toString('base64'));
+    expect(JSON.stringify(build({ model: 'test', input: [] }, options))).not.toContain(large.toString('base64'));
+  });
+
+  it.each(['chat', 'responses', 'anthropic', 'gemini'] as const)('filters native inline GIFs before the %s transport sends a request', async (protocol) => {
+    const gif = 'R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
+    const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a6ioAAAAASUVORK5CYII=';
+    const replies = {
+      chat: { id: 'chat_1', model: 'test', choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }] },
+      responses: { id: 'resp_1', model: 'test', status: 'completed', output: [{ type: 'message', id: 'msg_1', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'ok', annotations: [] }] }] },
+      anthropic: { id: 'msg_1', type: 'message', model: 'test', role: 'assistant', content: [{ type: 'text', text: 'ok' }], stop_reason: 'end_turn' },
+      gemini: { candidates: [{ content: { role: 'model', parts: [{ text: 'ok' }] }, finishReason: 'STOP' }] },
+    };
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify(replies[protocol]), {
+      headers: { 'Content-Type': 'application/json' },
+    }));
+    try {
+      const instance = OPENCODE.create('inline', entry({ multimodal: true, options: { protocol } }), host());
+      const request: Request = { model: 'test', input: [{ type: 'message', role: 'user', content: [
+        { type: 'input_text', text: 'keep talking' },
+        { type: 'input_image', image_url: `data:image/png;base64,${gif}` },
+        { type: 'input_image', image_url: `data:image/gif;base64,${png}` },
+      ] }] };
+      const original = structuredClone(request);
+      await instance.client.respond(request, { nativeSpec: { model: 'test', thinking: false } });
+      expect(fetchMock).toHaveBeenCalledOnce();
+      const body = String(fetchMock.mock.calls[0][1]?.body);
+      expect(body).toContain('keep talking');
+      expect(body).toContain('Image omitted');
+      expect(body).toContain(png);
+      expect(body).not.toContain(gif);
+      expect(body).not.toContain('image/gif');
+      expect(request).toEqual(original);
+    } finally {
+      fetchMock.mockRestore();
+    }
   });
 });
 

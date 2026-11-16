@@ -22,6 +22,7 @@ import { nativeChatInput, requestSpec, requestTools } from 'cortico/providers/tr
 import { identityHeaders, newSession } from './identity.ts';
 import { DEFAULT_EFFORT, MINIMUM_GEMINI_LEVEL } from './options.ts';
 import { SignatureStore } from './signatures.ts';
+import { chatImageCount, mediaForRequest } from './images.ts';
 
 type Shape = Record<string, any>;
 
@@ -70,7 +71,8 @@ function partsOf(content: unknown): Part[] {
  */
 export function buildGeminiBody(request: Request, options: GenerateOptions, media?: CompatMediaOptions, signatures?: SignatureStore): Record<string, unknown> {
   const spec = requestSpec(request, options);
-  const rendered = renderMessagesWithMedia(nativeChatInput(request, options), media) as Shape[];
+  const input = nativeChatInput(request, options);
+  const rendered = renderMessagesWithMedia(input, mediaForRequest(media, chatImageCount(input))) as Shape[];
   const names = new Map<string, string>();
   for (const message of rendered) {
     for (const call of (message.tool_calls ?? []) as Shape[]) {

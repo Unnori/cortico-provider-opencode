@@ -16,15 +16,10 @@ function stubFetch(body: unknown, ok = true): { seen: Seen[]; restore: () => voi
     const url = String(input);
     if (url.endsWith('/models')) {
       seen.push({ url, headers: (init?.headers ?? {}) as Record<string, string> });
-      return {
-        ok,
-        status: ok ? 200 : 401,
-        json: async () => (ok ? body : {}),
-        text: async () => (ok ? JSON.stringify(body) : ''),
-      } as unknown as Response;
+      return new Response(ok ? JSON.stringify(body) : '', { status: ok ? 200 : 401 });
     }
     // The models.dev lookup only adds context and price facts; an empty catalog leaves the ids as sent.
-    return { ok: true, status: 200, text: async () => '{}', json: async () => ({}) } as unknown as Response;
+    return new Response('{}');
   }) as unknown as typeof fetch;
   return { seen, restore: () => { globalThis.fetch = original; } };
 }

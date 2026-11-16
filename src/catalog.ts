@@ -11,6 +11,7 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import type { ListedModel } from 'cortico/providers/base.ts';
 import { modelListUrl, parseGateway } from './address.ts';
 import { identityHeaders } from './identity.ts';
+import { auxiliarySignal, parseJsonText, readLimitedText } from './http.ts';
 import type { Billing } from './pricing.ts';
 
 /** What the catalogue states about one model. */
@@ -41,8 +42,8 @@ export interface Catalog {
 
 const CATALOG_URL = 'https://models.dev/api.json';
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
-const FETCH_MS = 20_000;
 const MAX_BYTES = 32 * 1024 * 1024;
+const MODEL_LIST_MAX_BYTES = 2 * 1024 * 1024;
 
 export function modelsUrl(baseUrl: string, billing: Billing): string {
   const gateway = parseGateway(baseUrl);
@@ -52,16 +53,24 @@ export function modelsUrl(baseUrl: string, billing: Billing): string {
 async function gatewayIds(opts: CatalogOptions): Promise<string[]> {
   const key = opts.apiKey?.();
   const response = await fetch(modelsUrl(opts.baseUrl, opts.billing), {
+    signal: auxiliarySignal(),
+    redirect: 'error',
     headers: {
       Accept: 'application/json',
       ...(key ? { Authorization: `Bearer ${key}` } : {}),
       ...identityHeaders(''),
     },
   });
-  if (!response.ok) throw new Error(`OpenCode model list: HTTP ${response.status}`);
-  const body = (await response.json()) as { data?: { id?: unknown }[] };
-  const rows = Array.isArray(body.data) ? body.data : [];
-  return rows.flatMap((row) => (typeof row.id === 'string' && row.id ? [row.id] : []));
+  if (!response.ok) {
+    await response.body?.cancel().catch(() => {});
+    throw new Error(`OpenCode model list: HTTP ${response.status}`);
+  }
+  const body = parseJsonText(await readLimitedText(response, MODEL_LIST_MAX_BYTES, 'OpenCode model list'), 'OpenCode model list') as { data?: unknown[] } | null;
+  const rows = Array.isArray(body?.data) ? body.data : [];
+  return rows.flatMap((row) => {
+    const id = row && typeof row === 'object' ? (row as { id?: unknown }).id : undefined;
+    return typeof id === 'string' && id ? [id] : [];
+  });
 }
 
 function factsOf(raw: Record<string, any>): ModelFacts {
@@ -79,14 +88,14 @@ function factsOf(raw: Record<string, any>): ModelFacts {
 /** The facts for the ids asked about: OpenCode's own section first, then any other that lists the id. */
 export function pickFacts(catalog: Record<string, any>, ids: readonly string[]): Record<string, ModelFacts> {
   const wanted = new Set(ids);
-  const found: Record<string, ModelFacts> = {};
+  const found: Record<string, ModelFacts> = Object.create(null);
   const sections = [catalog.opencode, ...Object.values(catalog)].filter(
     (section): section is Record<string, any> => Boolean(section) && typeof section === 'object' && Boolean(section.models),
   );
   for (const section of sections) {
     for (const id of wanted) {
       if (found[id]) continue;
-      const raw = section.models?.[id];
+      const raw = Object.hasOwn(section.models, id) ? section.models[id] : undefined;
       if (raw && typeof raw === 'object') found[id] = factsOf(raw);
     }
   }
@@ -105,11 +114,15 @@ function readCache(file: string): { fetchedAt: string; models: Record<string, Mo
 }
 
 async function fetchFacts(ids: readonly string[]): Promise<Record<string, ModelFacts>> {
-  const response = await fetch(CATALOG_URL, { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(FETCH_MS) });
-  if (!response.ok) throw new Error(`models.dev: HTTP ${response.status}`);
-  const text = await response.text();
-  if (text.length > MAX_BYTES) throw new Error('models.dev: response too large');
-  return pickFacts(JSON.parse(text) as Record<string, any>, ids);
+  const response = await fetch(CATALOG_URL, {
+    headers: { Accept: 'application/json' }, signal: auxiliarySignal(), redirect: 'error',
+  });
+  if (!response.ok) {
+    await response.body?.cancel().catch(() => {});
+    throw new Error(`models.dev: HTTP ${response.status}`);
+  }
+  const text = await readLimitedText(response, MAX_BYTES, 'models.dev');
+  return pickFacts(parseJsonText(text, 'models.dev') as Record<string, any>, ids);
 }
 
 /**
@@ -121,7 +134,9 @@ const shared = new Map<string, Record<string, ModelFacts>>();
 function load(file: string): Record<string, ModelFacts> {
   const known = shared.get(file);
   if (known) return known;
-  const fromDisk = readCache(file)?.models ?? {};
+  // Model ids are external dictionary keys, including names such as `constructor` or `__proto__`.
+  // A null prototype also makes later Object.assign cache merges ordinary data writes.
+  const fromDisk: Record<string, ModelFacts> = Object.assign(Object.create(null), readCache(file)?.models);
   shared.set(file, fromDisk);
   return fromDisk;
 }
