@@ -6,6 +6,6 @@
     // 面板只 import type 框架类型,而那些类型文件引用 Node 的 Buffer 与 node:crypto,所以 node 类型仍要在。
     "types": ["node"]
   },
-  "include": ["src/webui/client.ts", "src/webui/allowance-panel.ts"],
+  "include": ["src/webui/client.ts", "src/webui/allowance-panel.ts", "src/webui/model-panel.ts"],
   "exclude": ["node_modules", "dist"]
 }

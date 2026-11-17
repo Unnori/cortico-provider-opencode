@@ -22,8 +22,12 @@ import { OpenCodeGemini } from './gemini.ts';
 import { identityHeaders, newSession } from './identity.ts';
 import { DEFAULT_EFFORT } from './options.ts';
 import type { LocalSpend } from './usage.ts';
+import { GenerationError } from 'cortico/core/generation.ts';
+import { chatMediaParts, prepareAttachments, type AttachmentPolicy } from './attachments.ts';
+import { applyGatewayMeters } from './meters.ts';
 import { salvagePartial } from './salvage.ts';
 import { chatImageCount, mediaForRequest, requestImageCount, sanitizeNativeImages } from './images.ts';
+import { chatToolMedia } from './protocol-contract.ts';
 
 export { USER_AGENT } from './identity.ts';
 export { OpenCodeMessages, OpenCodeGemini };
@@ -83,7 +87,7 @@ export class OpenCodeChat extends OpenAIHttpClient {
     this.session = sessionId ?? '';
     const body: Record<string, unknown> = {
       model: spec.model,
-      messages: renderMessagesWithMedia(messages, mediaForRequest(this.media, chatImageCount(messages))),
+      messages: chatToolMedia(chatMediaParts(renderMessagesWithMedia(messages, mediaForRequest(this.media, chatImageCount(messages))))),
     };
     // Leaving the field out does not mean off: the service then reasons on its own (85 reasoning tokens
     // measured on a plain question). `none` is what stops it.
@@ -179,6 +183,7 @@ export class SpendLedger {
 export interface ProviderOptions extends ClientOptions {
   protocol: Protocol;
   keepThinking: () => boolean;
+  attachments?: (model: string) => AttachmentPolicy;
   ledger?: SpendLedger;
   /** Called when the account refuses the key in use, so the next attempt uses the following one. */
   onKeyRefused?: () => void;
@@ -188,11 +193,14 @@ export interface ProviderOptions extends ClientOptions {
 export class OpenCodeProvider extends BaseProvider {
   private readonly client: OpenCodeChat | OpenCodeResponses | OpenCodeMessages | OpenCodeGemini;
   private readonly ledger?: SpendLedger;
+  private readonly attachmentPolicy?: (model: string) => AttachmentPolicy;
+  private readonly rejected = new Map<string, Set<string>>();
   private readonly media?: CompatMediaOptions;
 
   constructor(opts: ProviderOptions) {
     super();
     this.ledger = opts.ledger;
+    this.attachmentPolicy = opts.attachments;
     this.media = opts.media;
     const shared = {
       baseUrl: opts.baseUrl,
@@ -208,27 +216,66 @@ export class OpenCodeProvider extends BaseProvider {
         ? new OpenCodeGemini(shared)
         : opts.protocol === 'chat'
           ? new OpenCodeChat(shared)
-          : new OpenCodeResponses({ ...shared, keepThinking: opts.keepThinking, reasoningReplay: 'plaintext' });
+          : new OpenCodeResponses({ ...shared, keepThinking: opts.keepThinking, reasoningReplay: 'encrypted' });
   }
 
   override async respond(request: Request, options: GenerateOptions = {}): Promise<Generation> {
-    options = sanitizeNativeImages(request, options, this.media);
+    const original = options;
+    const policy = this.attachmentPolicy?.(request.model ?? '');
+    const rejected = this.rejected.get(request.model ?? '') ?? new Set<string>();
+    const prepared = policy ? prepareAttachments(request, options, { ...policy, rejected }) : undefined;
+    options = prepared?.options ?? sanitizeNativeImages(request, options, this.media);
     try {
       const generation = await this.client.respond(request, options);
-      this.record(request, generation);
+      this.record(request, generation, options);
       return generation;
     } catch (error) {
       if (options.signal?.aborted) throw error;
+      if (policy && prepared?.hashes.length && error instanceof GenerationError
+        && [400, 415, 422].includes(error.status) && !error.partial?.output?.length
+        && /(?:image|audio|video|media|mime|file|document).{0,100}(?:unsupported|not supported|invalid|format)|(?:unsupported|invalid).{0,100}(?:image|audio|video|media|mime|file|document)|400102/i.test(error.body + ' ' + error.message)) {
+        for (const hash of prepared.hashes) rejected.add(hash);
+        while (rejected.size > 512) rejected.delete(rejected.values().next().value!);
+        this.rejected.delete(request.model ?? '');
+        this.rejected.set(request.model ?? '', rejected);
+        while (this.rejected.size > 32) this.rejected.delete(this.rejected.keys().next().value!);
+        policy.dropped?.('upstream rejected media; retrying with text', 'batch');
+        const fallback = prepareAttachments(request, original, policy, true).options;
+        try {
+          const retried = await this.client.respond(request, fallback);
+          retried.attempts = [...error.attempts, ...retried.attempts];
+          this.record(request, retried, fallback);
+          return retried;
+        } catch (failure) {
+          if (failure instanceof GenerationError) throw new GenerationError(failure.message,
+            [...error.attempts, ...failure.attempts], failure.partial, failure.origin, failure.status, failure.body, { cause: failure });
+          throw failure;
+        }
+      }
       // A stream cut after it produced text would otherwise be retried from scratch, and an upstream
       // that cuts at the same point every time turns one answer into a long silence.
       const salvaged = salvagePartial(error);
       if (!salvaged) throw error;
-      this.record(request, salvaged);
+      this.record(request, salvaged, options);
       return salvaged;
     }
   }
 
-  private record(request: Request, generation: Generation): void {
+  private record(request: Request, generation: Generation, options: GenerateOptions): void {
+    const mediaTypes = new Set<string>();
+    for (const entry of options.context ?? []) {
+      const item = entry.item;
+      const parts = item.type === 'message' ? item.content : item.type === 'function_call_output' ? item.output : undefined;
+      if (!Array.isArray(parts)) continue;
+      for (const part of parts) {
+        if (part.type === 'input_image') mediaTypes.add('image');
+        if (part.type === 'input_file' && 'file_data' in part && part.file_data) {
+          const match = /^data:(audio|video)\//.exec(part.file_data);
+          if (match) mediaTypes.add(match[1]);
+        }
+      }
+    }
+    applyGatewayMeters(generation, mediaTypes);
     if (!this.ledger) return;
     const model = request.model ?? '';
     let usd = 0;

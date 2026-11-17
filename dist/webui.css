@@ -1,0 +1,4 @@
+/* src/webui/style.css */
+.connection-flow:has(.opencode-input-switches > .connection-toggle) > .connection-step > .connection-section > .foldbody > .connection-toggle {
+  display: none;
+}

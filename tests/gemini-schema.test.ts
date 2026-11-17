@@ -19,7 +19,7 @@ function keywords(node: unknown, found = new Set<string>()): Set<string> {
 }
 
 describe('Gemini function schema', () => {
-  it('drops the keyword the upstream refuses, at every level', () => {
+  it('preserves JSON Schema keywords in parametersJsonSchema at every level', () => {
     const schema = {
       type: 'object',
       additionalProperties: false,
@@ -31,10 +31,11 @@ describe('Gemini function schema', () => {
       required: ['text'],
     };
     const cleaned = geminiSchema(schema);
-    // The refusal is about this one keyword appearing anywhere in the tree.
-    expect(keywords(cleaned).has('additionalProperties')).toBe(false);
-    expect(JSON.stringify(cleaned)).not.toContain('additionalProperties');
-    // Everything Gemini does accept survives, so the model still sees the tool's shape.
+    // parametersJsonSchema is the JSON Schema surface; it is not Google Schema.
+    expect(keywords(cleaned).has('additionalProperties')).toBe(true);
+    expect(cleaned).toEqual(schema);
+    expect(cleaned).not.toBe(schema);
+    // Preserve every declared tool constraint.
     const survived = keywords(cleaned);
     for (const key of ['type', 'properties', 'required', 'items', 'description', 'minLength', 'maxLength']) {
       expect(survived.has(key)).toBe(true);

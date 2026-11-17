@@ -19,9 +19,10 @@ import { ChatResponseAssembly, type ResponseAssembly } from 'cortico/providers/t
 import { StreamErrorEvent } from 'cortico/providers/transport/errors.ts';
 import type { CompatMediaOptions } from 'cortico/providers/transport/history.ts';
 import { renderMessagesWithMedia } from 'cortico/providers/transport/history.ts';
-import { nativeChatInput, requestSpec, requestTools } from 'cortico/providers/transport/native-input.ts';
+import { nativeChatInput, requestContext, requestSpec, requestTools } from 'cortico/providers/transport/native-input.ts';
 import { identityHeaders, newSession } from './identity.ts';
-import { DEFAULT_EFFORT } from './options.ts';
+import { messagesForcedToolsAllowed, messagesSamplingAllowed, messagesThinking } from './protocol-contract.ts';
+import { parseDataUrl } from './attachments.ts';
 import { chatImageCount, mediaForRequest } from './images.ts';
 
 /** The Messages API requires a limit; this one applies when the endpoint states none. */
@@ -30,6 +31,31 @@ const ANTHROPIC_VERSION = '2023-06-01';
 
 type Block = Record<string, unknown>;
 type Rendered = Record<string, any>;
+const THINKING_PREFIX = 'opencode:messages:thinking:';
+const MAX_THINKING_CHARS = 16 * 1024 * 1024;
+
+/** Restore the exact signed blocks recorded by this dialect, never invent a signature. */
+function thinkingByCall(request: Request, options: GenerateOptions): Map<string, Block[]> {
+  const byCall = new Map<string, Block[]>();
+  let blocks: Block[] = [];
+  for (const entry of requestContext(request, options)) {
+    const item = entry.item;
+    if (item.type === 'reasoning') {
+      blocks = [];
+      const sealed = item.encrypted_content;
+      const owner = entry.context.origin;
+      if (owner && options.origin && (owner.instance !== options.origin.instance || owner.module !== options.origin.module
+        || owner.compatibilityDomain !== options.origin.compatibilityDomain)) continue;
+      if (typeof sealed !== 'string' || sealed.length > MAX_THINKING_CHARS || !sealed.startsWith(THINKING_PREFIX)) continue;
+      try {
+        const value = JSON.parse(sealed.slice(THINKING_PREFIX.length));
+        if (value.model === request.model && Array.isArray(value.blocks)) blocks = value.blocks;
+      } catch { /* A foreign or invalid opaque block cannot be replayed as Anthropic thinking. */ }
+    } else if (item.type === 'function_call') byCall.set(item.call_id, blocks);
+    else if (item.type === 'function_call_output' || item.type === 'message' && item.role === 'user') blocks = [];
+  }
+  return byCall;
+}
 
 function textOf(content: unknown): string {
   if (typeof content === 'string') return content;
@@ -38,7 +64,7 @@ function textOf(content: unknown): string {
     ? String((part as Rendered).text ?? '') : '')).join('');
 }
 
-/** Text and image parts as Messages blocks; an attachment the renderer could not read is already gone. */
+/** Text and media as Messages blocks; an attachment the renderer could not read is already gone. */
 function blocksOf(content: unknown): Block[] {
   if (typeof content === 'string') return content ? [{ type: 'text', text: content }] : [];
   if (!Array.isArray(content)) return [];
@@ -46,6 +72,12 @@ function blocksOf(content: unknown): Block[] {
   for (const part of content) {
     const value = part as Rendered;
     if (value?.type === 'text' && typeof value.text === 'string' && value.text) blocks.push({ type: 'text', text: value.text });
+    else if (value?.type === 'file') {
+      const data = parseDataUrl(String(value.file?.file_data ?? ''));
+      if (data) blocks.push({ type: 'document', source: data.mime === 'text/plain'
+        ? { type: 'text', media_type: 'text/plain', data: data.bytes.toString('utf8') }
+        : { type: 'base64', media_type: data.mime, data: data.bytes.toString('base64') }, ...(value.file?.filename ? { title: value.file.filename } : {}) });
+    }
     else if (value?.type === 'image_url') {
       const match = /^data:([^;]+);base64,(.*)$/s.exec(String(value.image_url?.url ?? ''));
       if (match) blocks.push({ type: 'image', source: { type: 'base64', media_type: match[1], data: match[2] } });
@@ -63,6 +95,7 @@ export function buildMessagesBody(request: Request, options: GenerateOptions, me
   const spec = requestSpec(request, options);
   const input = nativeChatInput(request, options);
   const rendered = renderMessagesWithMedia(input, mediaForRequest(media, chatImageCount(input))) as Rendered[];
+  const thinking = thinkingByCall(request, options);
   const system: string[] = [];
   const messages: Array<{ role: 'user' | 'assistant'; content: Block[] }> = [];
   const push = (role: 'user' | 'assistant', blocks: Block[]): void => {
@@ -79,14 +112,21 @@ export function buildMessagesBody(request: Request, options: GenerateOptions, me
     }
     if (message.role === 'assistant') {
       const blocks = blocksOf(message.content);
+      const signed = new Set<Block[]>();
       for (const call of (message.tool_calls ?? []) as Rendered[]) {
+        const previous = thinking.get(call.id);
+        if (previous?.length && !signed.has(previous)) { blocks.unshift(...previous); signed.add(previous); }
         blocks.push({ type: 'tool_use', id: call.id, name: call.function?.name, input: parseArguments(call.function?.arguments) });
       }
       push('assistant', blocks);
       continue;
     }
     if (message.role === 'tool') {
-      push('user', [{ type: 'tool_result', tool_use_id: message.tool_call_id, content: textOf(message.content) }]);
+      // Core's external event frames and normal tool results can both carry media.
+      // Preserve native blocks inside the result; plain-text results keep their string form.
+      const blocks = blocksOf(message.content);
+      const content = blocks.some(block => block.type !== 'text') ? blocks : textOf(message.content);
+      push('user', [{ type: 'tool_result', tool_use_id: message.tool_call_id, content }]);
       continue;
     }
     push('user', blocksOf(message.content));
@@ -97,17 +137,22 @@ export function buildMessagesBody(request: Request, options: GenerateOptions, me
     messages,
   };
   if (system.length) body.system = system.join('\n\n');
-  if (spec.temperature !== undefined) body.temperature = spec.temperature;
-  // Leaving thinking out does not mean off: the service then thinks on its own (141 reasoning tokens
-  // measured on a plain question). `disabled` is what actually stops it.
-  if (!spec.thinking) body.thinking = { type: 'disabled' };
-  else {
-    // Haiku 5.5 refuses `type: 'enabled'` with a budget and wants adaptive plus an effort level.
-    body.thinking = { type: 'adaptive' };
-    body.output_config = { effort: spec.reasoningEffort ?? DEFAULT_EFFORT };
-  }
+  if (spec.temperature !== undefined && messagesSamplingAllowed(spec)) body.temperature = spec.temperature;
+  Object.assign(body, messagesThinking({ ...spec, maxTokens: spec.maxTokens ?? DEFAULT_MAX_TOKENS }));
   const tools = requestTools(request);
   if (tools?.length) body.tools = tools.map((tool) => ({ name: tool.name, description: tool.description, input_schema: tool.parameters }));
+  if (tools?.length && request.tool_choice != null) {
+    const choice = request.tool_choice;
+    if ((choice === 'required' || typeof choice === 'object' && choice.type === 'function') && !messagesForcedToolsAllowed(spec)) {
+      throw new Error(`${spec.model} does not support forced tool use with this thinking mode; use tool_choice: auto`);
+    }
+    if (typeof choice === 'string') body.tool_choice = { type: choice === 'required' ? 'any' : choice };
+    else if (choice.type === 'function') body.tool_choice = { type: 'tool', name: choice.name };
+    else throw new Error('Messages cannot map this tool_choice');
+  }
+  if (tools?.length && request.parallel_tool_calls === false) {
+    body.tool_choice = { type: 'auto', ...(body.tool_choice as object ?? {}), disable_parallel_tool_use: true };
+  }
   return body;
 }
 
@@ -116,6 +161,7 @@ const STOP_REASONS: Readonly<Record<string, string>> = {
   end_turn: 'stop',
   stop_sequence: 'stop',
   max_tokens: 'length',
+  model_context_window_exceeded: 'length',
   tool_use: 'tool_calls',
   refusal: 'content_filter',
 };
@@ -128,10 +174,14 @@ function chatUsage(raw: Rendered | null): Record<string, unknown> | undefined {
   const output = number(raw.output_tokens);
   const read = number(raw.cache_read_input_tokens);
   const write = number(raw.cache_creation_input_tokens);
+  const reasoning = number(raw.output_tokens_details?.thinking_tokens);
   const prompt = input === null ? null : input + (read ?? 0) + (write ?? 0);
   return {
+    ...(typeof raw?.cost === 'number' ? { cost: raw.cost } : {}),
+    ...(raw?.opencode ? { opencode: raw.opencode } : {}),
     ...(prompt === null ? {} : { prompt_tokens: prompt }),
     ...(output === null ? {} : { completion_tokens: output }),
+    ...(reasoning === null ? {} : { completion_tokens_details: { reasoning_tokens: reasoning } }),
     ...(prompt === null || output === null ? {} : { total_tokens: prompt + output }),
     ...(read === null ? {} : { prompt_tokens_details: { cached_tokens: read } }),
   };
@@ -150,6 +200,9 @@ export class MessagesAssembly implements ResponseAssembly {
   private usage: Rendered | null = null;
   /** Set once the terminal chunk has been fed, so `finish` never feeds a second one. */
   private closed = false;
+  private readonly thinking: Rendered[] = [];
+  private readonly thinkingAt = new Map<number, Rendered>();
+  private thinkingCharacters = 0;
 
   constructor(request: Request) {
     this.inner = new ChatResponseAssembly(request);
@@ -173,11 +226,20 @@ export class MessagesAssembly implements ResponseAssembly {
       // `message_start` carries the token counts as the first estimate, and a stream that ends before
       // `message_delta` never repeats them; keeping them here is what makes usage readable at all.
       if (message.usage) this.usage = { ...(this.usage ?? {}), ...message.usage };
-      this.inner.feed({ id: message.id, model: message.model, choices: [{ delta: {} }] }, emit);
+      this.inner.feed({ id: message.id, model: message.model, usage: chatUsage(this.usage), choices: [{ delta: {} }] }, emit);
       return;
     }
     if (type === 'content_block_start') {
       const block = event.content_block ?? {};
+      if (block.type === 'thinking' || block.type === 'redacted_thinking') {
+        const saved = block.type === 'thinking' ? { type: 'thinking', thinking: String(block.thinking ?? ''), signature: String(block.signature ?? '') }
+          : { type: 'redacted_thinking', data: String(block.data ?? '') };
+        this.thinkingCharacters += JSON.stringify(saved).length;
+        if (this.thinkingCharacters > MAX_THINKING_CHARS) throw new StreamErrorEvent('Messages thinking data exceeded the buffer limit');
+        this.thinking.push(saved);
+        this.thinkingAt.set(event.index, saved);
+        if (block.thinking) this.inner.feed({ choices: [{ delta: { reasoning_content: block.thinking } }] }, emit);
+      }
       if (block.type === 'tool_use' && Number.isInteger(event.index)) {
         if (!this.tools.has(event.index) && this.tools.size >= MAX_MESSAGES_TOOL_CALLS) {
           throw new StreamErrorEvent('Messages response exceeded the tool block limit');
@@ -194,7 +256,17 @@ export class MessagesAssembly implements ResponseAssembly {
       if (delta.type === 'text_delta' && typeof delta.text === 'string' && delta.text) {
         this.inner.feed({ choices: [{ delta: { content: delta.text } }] }, emit);
       } else if (delta.type === 'thinking_delta' && typeof delta.thinking === 'string' && delta.thinking) {
+        const block = this.thinkingAt.get(event.index);
+        if (block) block.thinking += delta.thinking;
+        this.thinkingCharacters += delta.thinking.length;
+        if (this.thinkingCharacters > MAX_THINKING_CHARS) throw new StreamErrorEvent('Messages thinking data exceeded the buffer limit');
         this.inner.feed({ choices: [{ delta: { reasoning_content: delta.thinking } }] }, emit);
+      } else if (delta.type === 'signature_delta') {
+        const signature = String(delta.signature ?? '');
+        this.thinkingCharacters += signature.length;
+        if (this.thinkingCharacters > MAX_THINKING_CHARS) throw new StreamErrorEvent('Messages thinking data exceeded the buffer limit');
+        const block = this.thinkingAt.get(event.index);
+        if (block?.type === 'thinking') block.signature += signature;
       } else if (delta.type === 'input_json_delta') {
         const tool = this.tools.get(event.index);
         if (tool) {
@@ -217,6 +289,8 @@ export class MessagesAssembly implements ResponseAssembly {
     if (type === 'message_delta') {
       if (typeof event.delta?.stop_reason === 'string') this.stopReason = event.delta.stop_reason;
       if (event.usage) this.usage = { ...(this.usage ?? {}), ...event.usage };
+      if (!this.stopReason) { this.inner.feed({ usage: chatUsage(this.usage), choices: [{ delta: {} }] }, emit); return; }
+      if (!STOP_REASONS[this.stopReason]) throw new StreamErrorEvent(`Messages generation ended with ${this.stopReason}`);
       // The terminal chunk closes here rather than on `message_stop`: the stop reason and the final usage
       // arrive together on `message_delta`, and a stream cut after it still leaves a complete response.
       const usage = chatUsage(this.usage);
@@ -229,22 +303,20 @@ export class MessagesAssembly implements ResponseAssembly {
     }
   }
 
-  /**
-   * A stream can end after its content without the terminal chunk: `message_delta` is the only event
-   * that carries the stop reason and the usage, and a connection dropped just before it would otherwise
-   * surface as "Chat transport ended without finish_reason". Closing here turns that into a completed
-   * turn, the same way the Gemini translator closes a stream that never sent a finish reason.
-   */
+  /** A missing terminal delta stays a failure; the wrapper can retain partial text as incomplete. */
   finish(emit: (event: StreamEvent) => void): Response {
-    if (!this.closed) {
-      this.closed = true;
-      const usage = chatUsage(this.usage);
-      this.inner.feed({
-        ...(usage ? { usage } : {}),
-        choices: [{ delta: {}, finish_reason: STOP_REASONS[this.stopReason] ?? 'stop' }],
-      }, emit);
+    if (!this.closed) throw new StreamErrorEvent('Messages stream ended without message_delta');
+    const response = this.inner.finish(emit);
+    const blocks = this.thinking.filter(block => block.type === 'redacted_thinking' || block.signature);
+    if (blocks.length) {
+      let reasoning = response.output.find(item => item.type === 'reasoning');
+      if (!reasoning) {
+        reasoning = { type: 'reasoning', id: `rs_${crypto.randomUUID()}`, summary: [], content: [] };
+        response.output.unshift(reasoning);
+      }
+      reasoning.encrypted_content = THINKING_PREFIX + JSON.stringify({ model: response.model, blocks });
     }
-    return this.inner.finish(emit);
+    return response;
   }
   snapshot(): Response | null { return this.inner.snapshot(); }
   meters(): TokenMeters { return this.inner.meters(); }
@@ -258,9 +330,13 @@ export function parseMessages(raw: unknown, request: Request): { response: Respo
   const ignore = (() => {}) as unknown as (event: StreamEvent) => void;
   assembler.feed({ type: 'message_start', message: { id: data.id, model: data.model } }, ignore);
   data.content.forEach((block: Rendered, index: number) => {
-    assembler.feed({ type: 'content_block_start', index, content_block: block }, ignore);
+    assembler.feed({ type: 'content_block_start', index, content_block: block.type === 'thinking' ? { ...block, thinking: '', signature: '' } : block }, ignore);
     if (block.type === 'text' && block.text) assembler.feed({ type: 'content_block_delta', index, delta: { type: 'text_delta', text: block.text } }, ignore);
     if (block.type === 'tool_use') assembler.feed({ type: 'content_block_delta', index, delta: { type: 'input_json_delta', partial_json: JSON.stringify(block.input ?? {}) } }, ignore);
+    if (block.type === 'thinking') {
+      assembler.feed({ type: 'content_block_delta', index, delta: { type: 'thinking_delta', thinking: block.thinking } }, ignore);
+      assembler.feed({ type: 'content_block_delta', index, delta: { type: 'signature_delta', signature: block.signature } }, ignore);
+    }
     assembler.feed({ type: 'content_block_stop', index }, ignore);
   });
   assembler.feed({ type: 'message_delta', delta: { stop_reason: data.stop_reason }, usage: data.usage }, ignore);

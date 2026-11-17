@@ -17,5 +17,5 @@
   },
   "include": ["src/**/*.ts", "tests/**/*.ts"],
   // 浏览器产物由 tsconfig.web.json 检查。
-  "exclude": ["node_modules", "dist", "src/webui/client.ts", "src/webui/allowance-panel.ts"]
+  "exclude": ["node_modules", "dist", "src/webui/client.ts", "src/webui/allowance-panel.ts", "src/webui/model-panel.ts"]
 }

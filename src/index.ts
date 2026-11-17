@@ -17,7 +17,9 @@ import { baseUrlOf, parseGateway, PROTOCOLS, type Protocol } from './address.ts'
 import { BILLING_OPTIONS, billingOf, DEFAULT_MAX_TOKENS, DEFAULT_TEMPERATURE, keyNamesOf, optionsOf, protocolOf } from './options.ts';
 import { createKeyCursor } from './rotation.ts';
 import { guardedMedia, supportsImageMime } from './images.ts';
-import { createCatalog } from './catalog.ts';
+import { supportsAttachment } from './attachments.ts';
+import { metadataPrice } from './model-metadata.ts';
+import { createCatalog, knownFacts } from './catalog.ts';
 import { OpenCodeProvider, SpendLedger } from './native.ts';
 import { prices, type Billing, type UsageWindow } from './pricing.ts';
 import { advancePercent, readUsage, type UsageControl } from './usage.ts';
@@ -39,6 +41,8 @@ function optionsGroup(name: string, language: Language): ConfigGroup {
       properties: {
         [`providers.${name}.options.protocol`]: { type: 'string', enum: [...PROTOCOLS], title: t.protocol, description: t.protocolHint },
         [`providers.${name}.options.billing`]: { type: 'string', enum: [...BILLING_OPTIONS], title: t.billing, description: t.billingHint },
+        [`providers.${name}.options.goPlan`]: { type: 'string', enum: ['go', 'go-plus', 'go-teams'], title: language === 'en' ? 'Go plan (allowance estimate)' : 'Go 套餐（额度估算）', description: language === 'en' ? 'Used for local allowance estimates; does not change the account billed.' : '仅用于本机额度估算，不改变实际扣费账户。' },
+        [`providers.${name}.options.attachments`]: { type: 'string', enum: ['auto', 'off'], title: language === 'en' ? 'Attachments' : '原生附件', description: language === 'en' ? 'Auto follows model declarations; off sends fallback text.' : 'auto 按模型声明自动发送；off 只保留附件文本。图像开关仍可单独关闭图片。' },
         [`providers.${name}.options.keys`]: { type: 'string', title: t.keys, description: t.keysHint },
       },
     },
@@ -88,7 +92,7 @@ export const OPENCODE = {
   id: 'opencode',
   title: 'OpenCode',
   description: 'OpenCode 的模型供应商:默认走 Go 订阅的额度,支持 Responses、Chat、Messages 与 Gemini,内置价目与额度面板。',
-  describe: { protocols: ['openai-responses', 'openai-chat', 'anthropic-messages', 'gemini'], auth: ['api-key'], local: false, input: ['text', 'image'] },
+  describe: { protocols: ['openai-responses', 'openai-chat', 'anthropic-messages', 'gemini'], auth: ['api-key'], local: false, input: ['text', 'image', 'audio', 'video'] },
   defaultBaseUrl: 'https://opencode.ai/inference/go/openai/v1',
   baseUrlSuggestions: [
     'https://opencode.ai/inference/go/openai/v1',
@@ -107,10 +111,23 @@ export const OPENCODE = {
     const t = opencodeText(language);
     const { protocol, billing } = optionsOf(entry);
     if (protocol !== undefined && !PROTOCOLS.includes(protocol)) throw new Error(t.badProtocol(PROTOCOLS.join(' / ')));
+    if (optionsOf(entry).attachments !== undefined && !['auto', 'off'].includes(optionsOf(entry).attachments!)) throw new Error('attachments: auto / off');
+    if (optionsOf(entry).goPlan !== undefined && !['go', 'go-plus', 'go-teams'].includes(optionsOf(entry).goPlan!)) throw new Error('goPlan: go / go-plus / go-teams');
+    for (const key of ['inputAudio', 'inputVideo', 'inputFiles'] as const) {
+      if (optionsOf(entry)[key] !== undefined && typeof optionsOf(entry)[key] !== 'boolean') throw new Error(`${key}: boolean required`);
+    }
     if (billing !== undefined && !BILLING_OPTIONS.includes(billing)) throw new Error(t.badBilling(BILLING_OPTIONS.join(' / ')));
   },
-  accepts: (entry: LLMProviderEntry, _spec, mime: string) => entry.multimodal === true && supportsImageMime(mime),
-  prices: (entry: LLMProviderEntry, _request, at) => prices(billingOf(entry), at.startedAt),
+  accepts: (entry: LLMProviderEntry, spec, mime: string) => supportsAttachment({
+    facts: knownFacts(entry.baseUrl, billingOf(entry), spec.model), protocol: protocolOf(entry),
+    images: entry.multimodal, enabled: optionsOf(entry).attachments !== 'off',
+    audio: optionsOf(entry).inputAudio, video: optionsOf(entry).inputVideo, files: optionsOf(entry).inputFiles,
+  }, mime),
+  prices: (entry: LLMProviderEntry, request, at) => {
+    const defaults = prices(billingOf(entry), at.startedAt);
+    const live = metadataPrice(request.model ?? '', knownFacts(entry.baseUrl, billingOf(entry), request.model ?? ''), billingOf(entry), at.startedAt);
+    return live ? [...defaults.filter(price => !price.models.includes(request.model ?? '')), live] : defaults;
+  },
   contextOverflow: isContextOverflow,
   webUi: opencodeWebUi,
   create(name: string, entry: LLMProviderEntry, host): ProviderInstance {
@@ -147,6 +164,12 @@ export const OPENCODE = {
           ...(info.reason === 'dimensions' ? { width: info.size.width, height: info.size.height, limit: info.limit, count: info.count } : {}),
         }),
       }),
+      attachments: (model) => ({
+        facts: catalog.facts(model), protocol, images: currentEntry().multimodal,
+        enabled: optionsOf(currentEntry()).attachments !== 'off', read: host.readBlob,
+        audio: optionsOf(currentEntry()).inputAudio, video: optionsOf(currentEntry()).inputVideo, files: optionsOf(currentEntry()).inputFiles,
+        dropped: (reason, mime) => host.log.warn('opencode: attachment omitted', { reason, mime }),
+      }),
       keepThinking: host.keepThinking,
       ledger,
     });
@@ -160,8 +183,9 @@ export const OPENCODE = {
         ledger.clear();
         return usage;
       },
+      facts: (model: string) => catalog.facts(model),
       spend: () => ledger.snapshot(),
-      advance: (window: UsageWindow) => advancePercent(ledger.snapshot(), window),
+      advance: (window: UsageWindow) => advancePercent(ledger.snapshot(), window, optionsOf(currentEntry()).goPlan),
     };
     return {
       client: provider,

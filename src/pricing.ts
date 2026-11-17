@@ -1,5 +1,6 @@
 /**
- * OpenCode's published per-token prices in USD per million tokens, read on 2026-10-28 from
+ * OpenCode's published prices in USD per million tokens. The 2026-11-17 gateway snapshot takes
+ * precedence, including conditional, duration-specific and modality prices. Legacy rows were read on 2026-10-28 from
  * https://opencode.ai/v2/docs/console/models (Console balance) and .../console/go (a Go subscription).
  * The two pages state different numbers for the models they share and list different models, so each
  * has its own table; `prices()` returns the one matching how the endpoint bills.
@@ -11,6 +12,8 @@
  * `uncachedInput` meter; `output` includes reasoning. A `null` is a rate the page does not state,
  * and that meter is then recorded as unknown rather than guessed.
  */
+import snapshot from './models-snapshot.json' with { type: 'json' };
+import { factsOf, metadataPrice } from './model-metadata.ts';
 import type { PriceDefinition } from 'cortico/providers/pricebook.ts';
 import type { PriceRule } from 'cortico/core/generation.ts';
 import type { PriceWindow } from 'cortico/core/generation.ts';
@@ -174,7 +177,7 @@ export function prices(billing: Billing, startedAt: string): PriceDefinition[] {
   const rows = billing === 'go' ? GO_ROWS : CONSOLE_ROWS;
   const basis = billing === 'go' ? 'equivalent' : 'marginal';
   const source = billing === 'go' ? GO_SOURCE : CONSOLE_SOURCE;
-  return rows.map(({ id, rates: listed, band, reduced, peak }) => {
+  const legacy: PriceDefinition[] = rows.map(({ id, rates: listed, band, reduced, peak }) => {
     const window = reduced ? DISCOUNTS.find((entry) => entry.model === id) : undefined;
     const discounted = reduced !== undefined && (window === undefined || window.until === null || startedAt < window.until);
     const timeWindows: PriceWindow[] = peak
@@ -186,6 +189,12 @@ export function prices(billing: Billing, startedAt: string): PriceDefinition[] {
       ...(timeWindows.length ? { timeWindows } : {}),
     };
   });
+  const live = Object.entries(snapshot[billing]).flatMap(([model, raw]) => {
+    const definition = metadataPrice(model, factsOf(raw), billing, startedAt);
+    return definition ? [{ ...definition, source: `https://opencode.ai/docs/console/${billing === 'go' ? 'go' : 'models'}/ (2026-11-17)` }] : [];
+  });
+  const available = new Set(live.map(definition => definition.models[0]));
+  return [...legacy.filter(definition => !available.has(definition.models[0])), ...live];
 }
 
 /** The monthly allowance the Go page states for each model, in USD. */
@@ -194,8 +203,9 @@ const MONTHLY_LIMITS: Readonly<Record<string, number>> = Object.fromEntries(
 );
 
 /** The allowance the Go page states for one model, or null when it states none. */
-export function monthlyLimit(model: string): number | null {
-  return MONTHLY_LIMITS[model] ?? null;
+export function monthlyLimit(model: string, plan = 'go'): number | null {
+  const current = (snapshot.go as Record<string, any>)[model]?.go?.monthly_usage?.[plan];
+  return typeof current === 'number' && Number.isFinite(current) ? current : Object.hasOwn(MONTHLY_LIMITS, model) ? MONTHLY_LIMITS[model] : null;
 }
 
 /**

@@ -155,7 +155,7 @@ describe('multimodal history replay', () => {
       expect(body).toContain(`follow-up ${turn}`);
       expect(body).toContain(png.toString('base64'));
       expect(body).not.toContain(gif.toString('base64'));
-      expect(body).not.toContain('image/gif');
+      expect(body).not.toContain('data:image/gif;base64,');
     }
     expect(history[0]).toEqual(original);
     expect(dropped).toHaveLength(6);
@@ -208,10 +208,10 @@ describe('multimodal history replay', () => {
       expect(fetchMock).toHaveBeenCalledOnce();
       const body = String(fetchMock.mock.calls[0][1]?.body);
       expect(body).toContain('keep talking');
-      expect(body).toContain('Image omitted');
+      expect(body).toContain('Attachment omitted');
       expect(body).toContain(png);
       expect(body).not.toContain(gif);
-      expect(body).not.toContain('image/gif');
+      expect(body).not.toContain('data:image/gif;base64,');
       expect(request).toEqual(original);
     } finally {
       fetchMock.mockRestore();
@@ -299,11 +299,10 @@ describe('prices', () => {
   });
 
   it('bills Go DeepSeek at peak hours only, the rest of the week off-peak', () => {
-    const deepseek = prices('go', at).find((definition) => definition.models.includes('deepseek-v4-pro'));
-    expect(deepseek?.timeWindows?.map((window) => [window.from, window.to, window.timezone])).toEqual([
-      ['01:00', '04:00', 'UTC'],
-      ['06:00', '10:00', 'UTC'],
-    ]);
+    const rate = (date: string) => prices('go', date).find(definition => definition.models.includes('deepseek-v4-pro'))?.rules.find(rule => rule.meter === 'uncachedInput')?.perMillion;
+    expect(rate('2026-11-16T02:00:00Z')).toBe(1.32);
+    expect(rate('2026-11-16T05:00:00Z')).toBe(0.66);
+    expect(rate('2026-11-15T02:00:00Z')).toBe(0.66);
   });
 
   it('applies a stated discount inside its window and the list price after it', () => {
@@ -316,7 +315,7 @@ describe('prices', () => {
 
   it('states the monthly allowance the Go page gives each model', () => {
     expect(monthlyLimit('claude-haiku-5-5')).toBe(15);
-    expect(monthlyLimit('deepseek-v4.1-flash')).toBe(80);
+    expect(monthlyLimit('deepseek-v4.1-flash')).toBe(100);
     expect(monthlyLimit('not-a-model')).toBeNull();
   });
 });
@@ -376,7 +375,7 @@ describe('allowance panel', () => {
 
   it('lists the four connection blocks around its own section', () => {
     const panels = opencodeWebUi(webUiHost([entry()], {})).panels ?? [];
-    expect(panels.map((panel) => panel.id)).toEqual(['endpoint', 'model', ALLOWANCE_PANEL, 'pricing', 'protocol']);
+    expect(panels.map((panel) => panel.id)).toEqual(['endpoint', 'model', ALLOWANCE_PANEL, 'model-settings', 'protocol']);
     expect(opencodeWebUi(webUiHost([entry()], {})).config).toEqual([]);
   });
 
@@ -518,12 +517,11 @@ describe('Gemini dialect', () => {
     expect(assembly.meters().output).toBe(4);
   });
 
-  it('closes a stream that ended without a finish reason', () => {
+  it('reports a stream cut without a finish reason', () => {
     const assembly = new GeminiAssembly(request);
     const emit = (): void => {};
     assembly.feed({ candidates: [{ content: { parts: [{ text: 'done' }] } }] }, emit as never);
-    const response = assembly.finish(emit as never);
-    expect(response.status).toBe('completed');
+    expect(() => assembly.finish(emit as never)).toThrow('without finishReason');
   });
 
   it('maps a token-limit stop to an incomplete response', () => {
@@ -603,7 +601,7 @@ describe('the fixes the first field test needed', () => {
       opencode: { models: { 'glm-5.3': { name: 'GLM 5.3', limit: { context: 200_000, output: 8_192 }, modalities: { input: ['text', 'image'] } } } },
     };
     const facts = pickFacts(catalog, ['glm-5.3', 'missing']);
-    expect(facts['glm-5.3']).toEqual({ name: 'GLM 5.3', context: 200_000, output: 8_192, images: true });
+    expect(facts['glm-5.3']).toEqual({ name: 'GLM 5.3', context: 200_000, output: 8_192, images: true, input: ['text', 'image'] });
     expect(facts.missing).toBeUndefined();
   });
 });
@@ -912,15 +910,15 @@ describe('key rotation', () => {
 describe('Messages stream that ends without its terminal event', () => {
   const request = { model: 'claude-haiku-5-5', input: [] } as never;
 
-  it('closes the turn when the stream stops after content but before message_delta', () => {
+  it('reports an incomplete stream instead of manufacturing a normal stop', () => {
     const assembly = new MessagesAssembly(request);
     const emit = (): void => {};
     assembly.feed({ type: 'message_start', message: { id: 'msg_1', model: 'claude-haiku-5-5' } }, emit as never);
     assembly.feed({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }, emit as never);
     assembly.feed({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: '好的' } }, emit as never);
     // The connection drops here: no content_block_stop, no message_delta, no message_stop.
-    const response = assembly.finish(emit as never);
-    expect(response.status).toBe('completed');
+    expect(() => assembly.finish(emit as never)).toThrow('without message_delta');
+    const response = assembly.snapshot()!;
     const message = response.output.find((item) => item.type === 'message') as any;
     expect(message.content[0].text).toBe('好的');
   });

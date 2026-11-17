@@ -30,6 +30,11 @@ export const MINIMUM_GEMINI_LEVEL = 'LOW';
 export interface OpenCodeOptions {
   /** Unset: chat. */
   protocol?: Protocol;
+  attachments?: 'auto' | 'off';
+  inputAudio?: boolean;
+  inputVideo?: boolean;
+  inputFiles?: boolean;
+  goPlan?: 'go' | 'go-plus' | 'go-teams';
   /** Unset: `go`. */
   billing?: Billing;
   /**

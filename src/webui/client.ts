@@ -1,5 +1,7 @@
 import type { WebUiClientBundle } from 'cortico/web/shared/client-panel.ts';
+import { modelPanel } from './model-panel.ts';
 import { allowancePanel } from './allowance-panel.ts';
+import './style.css';
 
-// The endpoint table and the four connection blocks are the framework's own; only the allowance section ships here.
-export default { panels: { allowance: allowancePanel } } satisfies WebUiClientBundle;
+// Endpoint/model editing stays with the host; this bundle owns allowance and model input/pricing panels.
+export default { panels: { allowance: allowancePanel, 'model-settings': modelPanel } } satisfies WebUiClientBundle;

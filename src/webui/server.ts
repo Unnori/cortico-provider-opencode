@@ -1,6 +1,5 @@
 /**
- * The allowance section of the endpoint page, and its data plane. This module ships one panel, so the
- * four built-in connection blocks are listed around it: endpoint, model, allowance, pricing, protocol.
+ * Endpoint allowance, model input declarations and automatic/custom pricing panels.
  *
  * `state` answers whether a read is even possible, without touching the network — a brand-new endpoint
  * has no key yet, and asking the gateway then only produces an error nobody caused. `read` asks the
@@ -11,7 +10,9 @@
 import type { WebUiPageContribution } from 'cortico/web/shared/webui-protocol.ts';
 import type { ProviderWebUiHost } from 'cortico/providers/webui/types.ts';
 import { connectionBlocks } from 'cortico/providers/webui/config.ts';
-import { billingOf } from '../options.ts';
+import { validatePrices } from 'cortico/providers/pricebook.ts';
+import { MODEL_SETTINGS_PANEL, inputCapabilities, modelSettings, type InputCapabilities, type ModelSettings } from './model-settings.ts';
+import { billingOf, optionsOf } from '../options.ts';
 import { parseGateway } from '../address.ts';
 import { monthlyLimit, prices, type UsageWindow } from '../pricing.ts';
 import type { GoUsage, LocalSpend, UsageControl } from '../usage.ts';
@@ -75,10 +76,41 @@ export function opencodeWebUi(host: ProviderWebUiHost): Partial<WebUiPageContrib
       blocks.endpoint,
       blocks.model,
       { id: ALLOWANCE_PANEL, title: t.allowancePanel, description: t.allowancePanelHint, defaultOpen: true },
-      blocks.pricing,
+      { id: MODEL_SETTINGS_PANEL, title: host.language === 'en' ? 'Model inputs and pricing' : '模型输入与计价', defaultOpen: true, getMethods: ['input-capabilities'] },
       blocks.protocol,
     ],
-    invoke: async (panel, method, args): Promise<AllowanceState | LocalState | ModelState | ReadyState> => {
+    invoke: async (panel, method, args): Promise<AllowanceState | LocalState | ModelState | ReadyState | ModelSettings | InputCapabilities> => {
+      if (panel === MODEL_SETTINGS_PANEL) {
+        const name = nameOf(args, t);
+        const entry = host.entries().find(item => item.name === name)?.entry;
+        if (!entry) throw new Error(t.instanceRequired);
+        const facts = (host.instance(name).control as UsageControl | undefined)?.facts?.(entry.spec?.model ?? '');
+        if (method === 'input-capabilities') {
+          const { mimes = [] } = args[0] as { mimes?: unknown };
+          if (!Array.isArray(mimes) || mimes.length > 128 || mimes.some(mime => typeof mime !== 'string' || !mime.includes('/') || mime.length > 256)) throw new Error('Invalid MIME query');
+          return inputCapabilities(entry, facts, mimes);
+        }
+        if (method === 'pricing-state') return modelSettings(entry, facts);
+        const raw = args[0] as { model?: unknown; definitions?: unknown };
+        if (raw.model !== entry.spec?.model) throw new Error('Model changed; refresh pricing before applying');
+        if (method === 'input-save') {
+          const value = args[0] as { kind?: unknown; enabled?: unknown };
+          if (!['image', 'audio', 'video', 'file'].includes(String(value.kind)) || typeof value.enabled !== 'boolean') throw new Error('Invalid input setting');
+          const state = modelSettings(entry, facts);
+          if (value.enabled && !state.inputs.find(input => input.kind === value.kind)?.available) throw new Error('Input type is not supported by the model or protocol');
+          const options = { ...entry.options };
+          if (value.enabled) options.attachments = 'auto';
+          if (value.kind !== 'image') options[value.kind === 'audio' ? 'inputAudio' : value.kind === 'video' ? 'inputVideo' : 'inputFiles'] = value.enabled;
+          host.save(name, { ...entry, options, ...(value.kind === 'image' ? { multimodal: value.enabled } : {}) });
+        } else if (method === 'pricing-reset') {
+          host.save(name, { ...entry, pricing: (entry.pricing ?? []).filter(definition => !definition.models.includes(String(raw.model)) && !definition.models.includes('*')) });
+        } else if (method === 'pricing-save') {
+          const definitions = validatePrices(raw.definitions, host.language);
+          if (definitions.some(definition => definition.models.length !== 1 || definition.models[0] !== raw.model)) throw new Error('Custom prices must name the selected model');
+          host.save(name, { ...entry, pricing: [...(entry.pricing ?? []).filter(definition => !definition.models.includes(String(raw.model)) && !definition.models.includes('*')), ...definitions] });
+        } else throw new Error(t.unknownMethod(method));
+        return modelSettings(host.entries().find(item => item.name === name)!.entry, facts);
+      }
       if (panel !== ALLOWANCE_PANEL) throw new Error(t.unknownMethod(panel));
       if (method !== 'read' && method !== 'local' && method !== 'model' && method !== 'state') throw new Error(t.unknownMethod(method));
       const name = nameOf(args, t);
@@ -98,7 +130,7 @@ export function opencodeWebUi(host: ProviderWebUiHost): Partial<WebUiPageContrib
           model,
           line: t.modelRates(model, contextWindow === null ? null : `${contextWindow.toLocaleString('en-US')} tokens`, money(input), money(output)),
           contextWindow,
-          monthlyLimit: monthlyLimit(model),
+          monthlyLimit: monthlyLimit(model, optionsOf(entry).goPlan),
           rates: {
             input,
             output,

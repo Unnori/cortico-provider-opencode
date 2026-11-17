@@ -26,8 +26,7 @@ describe('Messages usage', () => {
     assembly.feed({ type: 'message_start', message: { id: 'msg_1', model: 'claude-haiku-5-5', usage: startUsage } }, emit as never);
     assembly.feed({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'hi' } }, emit as never);
     // Nothing closes the stream: this is the shape that used to record null tokens.
-    const response = assembly.finish(emit as never);
-    expect(response.status).toBe('completed');
+    expect(() => assembly.finish(emit as never)).toThrow('without message_delta');
     expect(assembly.meters().input).toBe(13);
     expect(assembly.meters().output).toBe(3);
     expect(assembly.meters().total).toBe(16);
@@ -53,7 +52,7 @@ describe('Messages usage', () => {
     const assembly = new MessagesAssembly(request);
     const emit = (): void => {};
     assembly.feed({ type: 'message_start', message: { id: 'm', model: 'm', usage: { input_tokens: 10, output_tokens: 1, cache_read_input_tokens: 90, cache_creation_input_tokens: 0 } } }, emit as never);
-    assembly.finish(emit as never);
+    expect(() => assembly.finish(emit as never)).toThrow('without message_delta');
     // input_tokens excludes cache reads on this API, so the prompt is 100 and the cache 90.
     expect(assembly.meters().input).toBe(100);
     expect(assembly.meters().cachedInput).toBe(90);
@@ -77,7 +76,7 @@ describe('Messages usage', () => {
     const emit = (): void => {};
     assembly.feed({ type: 'message_start', message: { id: 'm', model: 'm' } }, emit as never);
     assembly.feed({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'x' } }, emit as never);
-    assembly.finish(emit as never);
+    expect(() => assembly.finish(emit as never)).toThrow('without message_delta');
     expect(assembly.meters().input).toBeNull();
     expect(assembly.meters().output).toBeNull();
   });

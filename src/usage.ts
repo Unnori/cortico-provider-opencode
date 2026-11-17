@@ -107,11 +107,11 @@ export async function readUsage(
  * Null when no model in the ledger states a monthly allowance — the page lists one for every model it
  * counts, so null means the spend cannot be attributed.
  */
-export function advancePercent(spend: Readonly<Record<string, number>>, window: UsageWindow): number | null {
+export function advancePercent(spend: Readonly<Record<string, number>>, window: UsageWindow, plan = 'go'): number | null {
   let percent = 0;
   let attributed = false;
   for (const [model, usd] of Object.entries(spend)) {
-    const limit = monthlyLimit(model);
+    const limit = monthlyLimit(model, plan);
     if (limit === null || limit <= 0 || !Number.isFinite(usd) || usd <= 0) continue;
     attributed = true;
     percent += (usd / (limit * WINDOW_SHARE[window])) * 100;
@@ -124,6 +124,7 @@ export type LocalSpend = Readonly<Record<string, number>>;
 
 /** What the allowance panel can ask one endpoint, carried on `ProviderInstance.control`. */
 export interface UsageControl {
+  facts?(model: string): import('./model-metadata.ts').ModelFacts | undefined;
   /** Reads the gateway's allowance windows and clears the local ledger. */
   read(): Promise<GoUsage>;
   /** Whether the endpoint's key is readable right now; the panel asks before spending a request. */

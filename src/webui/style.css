@@ -1,0 +1,7 @@
+/* The adapter's input row owns multimodal too. Hide the host's duplicate only
+   after our switches have rendered, within that connection's flow. Other
+   providers and a failed/unavailable custom panel keep the host control. */
+.connection-flow:has(.opencode-input-switches > .connection-toggle)
+  > .connection-step > .connection-section > .foldbody > .connection-toggle {
+  display: none;
+}

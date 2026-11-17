@@ -4,8 +4,7 @@
  * path is set per request; `super.respond` reads it before its first await, so concurrent requests
  * cannot observe each other's path.
  *
- * The key goes out both ways: OpenCode documents `Authorization: Bearer`, while the Gemini API itself
- * reads `x-goog-api-key`. Each side ignores the header it does not read.
+ * Gateway authentication follows OpenCode's documented `Authorization: Bearer` header.
  *
  * Like the other dialects the reply is translated into the Chat chunks the framework validates, so
  * items, tool calls, finish reasons and meters take the same path.
@@ -20,18 +19,13 @@ import { StreamErrorEvent } from 'cortico/providers/transport/errors.ts';
 import { renderMessagesWithMedia, type CompatMediaOptions } from 'cortico/providers/transport/history.ts';
 import { nativeChatInput, requestSpec, requestTools } from 'cortico/providers/transport/native-input.ts';
 import { identityHeaders, newSession } from './identity.ts';
-import { DEFAULT_EFFORT, MINIMUM_GEMINI_LEVEL } from './options.ts';
+import { geminiThinking } from './protocol-contract.ts';
 import { SignatureStore } from './signatures.ts';
+import { parseDataUrl } from './attachments.ts';
 import { chatImageCount, mediaForRequest } from './images.ts';
 
 type Shape = Record<string, any>;
 
-/** The level enum Gemini accepts. A value outside it is refused outright, so anything unknown is medium. */
-const GEMINI_LEVELS: Readonly<Record<string, string>> = { low: 'LOW', medium: 'MEDIUM', high: 'HIGH' };
-
-function geminiLevel(effort: string | undefined): string {
-  return GEMINI_LEVELS[(effort ?? DEFAULT_EFFORT).toLowerCase()] ?? GEMINI_LEVELS[DEFAULT_EFFORT]!;
-}
 type Part = Record<string, unknown>;
 
 const DEFAULT_MAX_TOKENS = 8192;
@@ -49,7 +43,7 @@ function textOf(content: unknown): string {
     ? String((part as Shape).text ?? '') : '')).join('');
 }
 
-/** Text and inline image parts; Gemini takes bytes inline, base64 encoded. */
+/** Text and inline media parts; Gemini takes attachment bytes inline, base64 encoded. */
 function partsOf(content: unknown): Part[] {
   if (typeof content === 'string') return content ? [{ text: content }] : [];
   if (!Array.isArray(content)) return [];
@@ -57,6 +51,10 @@ function partsOf(content: unknown): Part[] {
   for (const part of content) {
     const value = part as Shape;
     if (value?.type === 'text' && typeof value.text === 'string' && value.text) parts.push({ text: value.text });
+    else if (value?.type === 'file') {
+      const data = parseDataUrl(String(value.file?.file_data ?? ''));
+      if (data) parts.push({ inlineData: { mimeType: data.mime, data: data.bytes.toString('base64') } });
+    }
     else if (value?.type === 'image_url') {
       const match = /^data:([^;]+);base64,(.*)$/s.exec(String(value.image_url?.url ?? ''));
       if (match) parts.push({ inlineData: { mimeType: match[1], data: match[2] } });
@@ -102,7 +100,16 @@ export function buildGeminiBody(request: Request, options: GenerateOptions, medi
     }
     contents.push({ role, parts });
   };
+  // Core delivers external events as tool results. Keep their native media after the
+  // complete response turn and before the next user/model turn, so media stays
+  // with its source result and parallel functionCall/functionResponse counts match.
+  let toolMedia: Part[] = [];
+  const flushToolMedia = (): void => {
+    if (toolMedia.length) push('user', toolMedia);
+    toolMedia = [];
+  };
   for (const message of rendered) {
+    if (message.role !== 'tool') flushToolMedia();
     if (message.role === 'system') {
       const text = textOf(message.content);
       if (text) system.push(text);
@@ -125,10 +132,12 @@ export function buildGeminiBody(request: Request, options: GenerateOptions, medi
     if (message.role === 'tool') {
       const name = names.get(String(message.tool_call_id ?? '')) ?? 'tool';
       push('user', [{ functionResponse: { name, response: { result: textOf(message.content) } } }]);
+      toolMedia.push(...partsOf(message.content).filter((part) => 'inlineData' in part));
       continue;
     }
     push('user', partsOf(message.content));
   }
+  flushToolMedia();
   // Gemini refuses a request whose last content is `model` ("Requests ending with a model turn are not
   // supported"). That happens whenever the framework sends history that ends on an assistant turn — for
   // example a round cut short after a tool call, or a turn that only pushed events. The nudge is pushed
@@ -140,67 +149,33 @@ export function buildGeminiBody(request: Request, options: GenerateOptions, medi
   if (system.length) body.systemInstruction = { parts: [{ text: system.join('\n\n') }] };
   const generationConfig: Record<string, unknown> = { maxOutputTokens: spec.maxTokens ?? DEFAULT_MAX_TOKENS };
   if (spec.temperature !== undefined) generationConfig.temperature = spec.temperature;
-  // This model family takes a level, not a budget, and has no level that means "no thinking": the
-  // lowest one is the closest a request can get. Levels are refused if spelled anything but the enum.
-  generationConfig.thinkingConfig = {
-    thinkingLevel: spec.thinking ? geminiLevel(spec.reasoningEffort) : MINIMUM_GEMINI_LEVEL,
-  };
+  const thinking = geminiThinking(spec);
+  if (thinking) generationConfig.thinkingConfig = thinking;
   body.generationConfig = generationConfig;
   const tools = requestTools(request);
   if (tools?.length) {
     body.tools = [{ functionDeclarations: tools.map((tool) => ({
       name: tool.name,
       description: tool.description,
-      parameters: geminiSchema(tool.parameters),
+      parametersJsonSchema: geminiSchema(tool.parameters),
     })) }];
+    if (request.tool_choice != null) {
+      const choice = request.tool_choice;
+      const config = typeof choice === 'string'
+        ? { mode: choice === 'none' ? 'NONE' : choice === 'required' ? 'ANY' : 'AUTO' }
+        : choice.type === 'function' ? { mode: 'ANY', allowedFunctionNames: [choice.name] } : undefined;
+      if (!config) throw new Error('Gemini cannot map this tool_choice');
+      body.toolConfig = { functionCallingConfig: config };
+    }
   }
   return body;
 }
 
-/**
- * A JSON Schema reduced to the subset Gemini's `functionDeclarations` accepts.
- *
- * Gemini validates `parameters` against an OpenAPI-derived schema and rejects the whole request when it
- * meets a keyword it does not model — `additionalProperties` alone fails every turn once one tool in
- * the table carries it. Unknown keywords are dropped rather than rejected, which keeps a tool usable
- * instead of removing the request.
- */
-const SCHEMA_KEYWORDS = new Set([
-  'type', 'format', 'title', 'description', 'nullable', 'enum', 'const',
-  'items', 'properties', 'required', 'minItems', 'maxItems', 'uniqueItems',
-  'minimum', 'maximum', 'minLength', 'maxLength', 'pattern', 'default',
-  'anyOf', 'oneOf', 'allOf', 'not', 'example',
-]);
-
+/** Use the documented JSON Schema field instead of the restricted OpenAPI Schema.
+ * Preserve numeric enums, refs, unions and const without changing tool argument types. */
 export function geminiSchema(schema: unknown): Record<string, unknown> {
-  const value = schema as Record<string, unknown> | null | undefined;
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return { type: 'object', properties: {} };
-  const out: Record<string, unknown> = {};
-  for (const [key, raw] of Object.entries(value)) {
-    if (!SCHEMA_KEYWORDS.has(key)) continue;
-    if (key === 'properties' && raw && typeof raw === 'object' && !Array.isArray(raw)) {
-      const properties: Record<string, unknown> = {};
-      for (const [name, child] of Object.entries(raw as Record<string, unknown>)) {
-        properties[name] = geminiSchema(child);
-      }
-      out.properties = properties;
-      continue;
-    }
-    if (key === 'items') {
-      out.items = Array.isArray(raw) ? raw.map((item) => geminiSchema(item)) : geminiSchema(raw);
-      continue;
-    }
-    if (key === 'anyOf' || key === 'oneOf' || key === 'allOf') {
-      if (Array.isArray(raw)) out[key] = raw.map((item) => geminiSchema(item));
-      continue;
-    }
-    if (key === 'not') {
-      out.not = geminiSchema(raw);
-      continue;
-    }
-    out[key] = raw;
-  }
-  // Gemini wants an object schema to state its properties; a bare `type: object` is rejected.
+  if (!schema || typeof schema !== 'object' || Array.isArray(schema)) return { type: 'object', properties: {} };
+  const out = structuredClone(schema) as Record<string, unknown>;
   if (out.type === 'object' && out.properties === undefined) out.properties = {};
   return out;
 }
@@ -217,6 +192,10 @@ const FINISH_REASONS: Readonly<Record<string, string>> = {
   RECITATION: 'content_filter',
   BLOCKLIST: 'content_filter',
   PROHIBITED_CONTENT: 'content_filter',
+  SPII: 'content_filter',
+  IMAGE_SAFETY: 'content_filter',
+  IMAGE_PROHIBITED_CONTENT: 'content_filter',
+  IMAGE_RECITATION: 'content_filter',
 };
 
 function chatUsage(raw: Shape | null | undefined): Record<string, unknown> | undefined {
@@ -224,11 +203,16 @@ function chatUsage(raw: Shape | null | undefined): Record<string, unknown> | und
   const number = (value: unknown): number | null => (typeof value === 'number' && Number.isFinite(value) ? value : null);
   const prompt = number(raw.promptTokenCount);
   const candidates = number(raw.candidatesTokenCount);
+  const thoughts = number(raw.thoughtsTokenCount);
   const cached = number(raw.cachedContentTokenCount);
   return {
+    ...(typeof raw?.cost === 'number' ? { cost: raw.cost } : {}),
+    ...(raw?.opencode ? { opencode: raw.opencode } : {}),
     ...(prompt === null ? {} : { prompt_tokens: prompt }),
-    ...(candidates === null ? {} : { completion_tokens: candidates }),
-    ...(prompt === null || candidates === null ? {} : { total_tokens: prompt + candidates }),
+    ...(candidates === null ? {} : { completion_tokens: candidates + (thoughts ?? 0) }),
+    ...(thoughts === null ? {} : { completion_tokens_details: { reasoning_tokens: thoughts } }),
+    ...(number(raw.totalTokenCount) !== null ? { total_tokens: raw.totalTokenCount }
+      : prompt === null || candidates === null ? {} : { total_tokens: prompt + candidates + (thoughts ?? 0) }),
     ...(cached === null ? {} : { prompt_tokens_details: { cached_tokens: cached } }),
   };
 }
@@ -247,13 +231,18 @@ export class GeminiAssembly implements ResponseAssembly {
     const chunk = payload as Shape;
     if (!chunk || typeof chunk !== 'object') throw new Error('Invalid Gemini chunk');
     if (chunk.error) throw new StreamErrorEvent(JSON.stringify(chunk.error));
+    if (chunk.promptFeedback?.blockReason) throw new StreamErrorEvent(`Gemini blocked prompt: ${chunk.promptFeedback.blockReason}`);
     const candidate = (chunk.candidates ?? [])[0] as Shape | undefined;
     const usage = chatUsage(chunk.usageMetadata);
     if (!candidate) {
       if (usage) this.inner.feed({ usage, choices: [{ delta: {} }] }, emit);
       return;
     }
-    if (typeof candidate.finishReason === 'string') this.finishReason = FINISH_REASONS[candidate.finishReason] ?? 'stop';
+    if (typeof candidate.finishReason === 'string') {
+      const reason = FINISH_REASONS[candidate.finishReason];
+      if (!reason) throw new StreamErrorEvent(`Gemini generation ended with ${candidate.finishReason}`);
+      this.finishReason = reason;
+    }
     const parts = (candidate.content?.parts ?? []) as Shape[];
     for (const part of parts) {
       if (typeof part.text === 'string' && part.text) {
@@ -276,8 +265,8 @@ export class GeminiAssembly implements ResponseAssembly {
   }
 
   finish(emit: (event: StreamEvent) => void): Response {
-    // A stream can end without a candidate, so the terminal chunk is fed here when nothing closed it.
-    if (!this.finishReason) this.inner.feed({ choices: [{ delta: {}, finish_reason: 'stop' }] }, emit);
+    // The wrapper salvages partial text as incomplete; disconnection is not a normal stop.
+    if (!this.finishReason) throw new StreamErrorEvent('Gemini stream ended without finishReason');
     return this.inner.finish(emit);
   }
 
@@ -369,7 +358,7 @@ export class OpenCodeGemini extends OpenAIHttpClient {
     return {
       'Content-Type': 'application/json',
       ...identityHeaders(this.session || this.fallback),
-      ...(key ? { Authorization: `Bearer ${key}`, 'x-goog-api-key': key } : {}),
+      ...(key ? { Authorization: `Bearer ${key}` } : {}),
     };
   }
 }
