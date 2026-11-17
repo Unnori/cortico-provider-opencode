@@ -8,6 +8,7 @@ import type { Protocol } from './address.ts';
 import { canonicalMime, declaredInput, type ModelFacts } from './model-metadata.ts';
 import { imageSize, longSideLimit, supportsImageMime } from './images.ts';
 import { protocolAccepts } from './protocol-contract.ts';
+import { attachmentWindow } from './attachment-window.ts';
 
 export const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
 export const MAX_REQUEST_MEDIA_BYTES = 40 * 1024 * 1024;
@@ -130,7 +131,10 @@ export function prepareAttachments(request: Request, options: GenerateOptions, p
     candidates.push({ bytes, mime, hash, part, size });
     return part;
   };
-  const context = requestContext(request, options).map(entry => {
+  const history = requestContext(request, options);
+  const from = attachmentWindow(history);
+  const historical = (name: string): Part => ({ type: 'input_text', text: `[Previous attachment: ${name}; original omitted from this request. Reattach to inspect the original.]` });
+  const context = history.map((entry, index) => {
     const item = entry.item;
     if (item.type !== 'message' && item.type !== 'function_call_output') return entry;
     const field = item.type === 'message' ? 'content' : 'output';
@@ -139,6 +143,7 @@ export function prepareAttachments(request: Request, options: GenerateOptions, p
     const parts: Part[] = typeof content === 'string' ? [{ type: 'input_text', text: content }] : (content ?? []).map((raw): Part => {
       const part = raw as Part;
       if (!['input_image', 'input_file', 'input_audio', 'input_video'].includes(part.type)) return part;
+      if (index < from) return historical(String(part.filename ?? part.type));
       const url = part.image_url ?? part.file_data ?? part.video_url;
       const data = typeof url === 'string' ? parseDataUrl(url) : part.type === 'input_audio' && part.input_audio?.data
         ? parseDataUrl(`data:audio/${part.input_audio.format};base64,${part.input_audio.data}`) : null;
@@ -147,6 +152,10 @@ export function prepareAttachments(request: Request, options: GenerateOptions, p
     });
     for (const ref of entry.context.blobs ?? []) {
       if (ref.fallbackText && !parts.some(part => typeof part.text === 'string' && part.text.includes(ref.fallbackText))) parts.push({ type: 'input_text', text: ref.fallbackText });
+      if (index < from) {
+        if (!ref.fallbackText) parts.push(historical(ref.name ?? ref.mime));
+        continue;
+      }
       if (textOnly || policy.enabled === false) { parts.push(omit('disabled or text fallback', ref.mime)); continue; }
       let bytes: Buffer | null = null;
       try { bytes = policy.read(ref.handle); } catch { /* Unreadable media keeps its fallback text. */ }

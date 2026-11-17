@@ -111,10 +111,10 @@ describe('native wire attachments', () => {
 
   it('keeps parallel tool responses together and emits their media after the full response group', async () => {
     const context = [
+      message('user', 'inspect both'),
       functionCall('a', 'read_one', '{}'), functionCall('b', 'read_two', '{}'),
       functionResult('a', 'first', { blobs: [{ handle: 'pdf', mime: 'application/pdf', fallbackText: '[pdf]' }] }),
       functionResult('b', 'second', { blobs: [{ handle: 'wav', mime: 'audio/wav', fallbackText: '[wav]' }] }),
-      message('user', 'inspect both'),
       functionCall('c', 'next_step', '{}'), functionResult('c', 'done'),
     ];
     const bodies: any[] = [];
@@ -124,15 +124,14 @@ describe('native wire attachments', () => {
     });
     await client.respond({ model: 'fixture', input: [] }, { context });
     const contents = bodies[0].contents;
-    expect(contents[0].parts).toHaveLength(2);
-    expect(contents[1].parts.map((part: any) => part.functionResponse.name)).toEqual(['read_one', 'read_two']);
-    expect(contents[2].parts.filter((part: any) => part.inlineData).map((part: any) => part.inlineData.mimeType)).toEqual(['application/pdf', 'audio/wav']);
-    expect(contents[2].parts.at(-1)).toEqual({ text: 'inspect both' });
-    expect(contents[3].parts[0].functionCall.name).toBe('next_step');
-    expect(contents[4].parts[0].functionResponse.name).toBe('next_step');
+    expect(contents[1].parts).toHaveLength(2);
+    expect(contents[2].parts.map((part: any) => part.functionResponse.name)).toEqual(['read_one', 'read_two']);
+    expect(contents[3].parts.map((part: any) => part.inlineData.mimeType)).toEqual(['application/pdf', 'audio/wav']);
+    expect(contents[4].parts[0].functionCall.name).toBe('next_step');
+    expect(contents[5].parts[0].functionResponse.name).toBe('next_step');
   });
 
-  it('keeps media beside its original result group when replaying multiple external event frames', async () => {
+  it('expires media from older event frames while preserving the latest frame and response order', async () => {
     const context = [
       functionCall('frame_1', 'external_event_frame', '{}'),
       functionResult('frame_1', 'first event', { blobs: [{ handle: 'pdf', mime: 'application/pdf', fallbackText: '[pdf]' }] }),
@@ -147,12 +146,12 @@ describe('native wire attachments', () => {
     });
     await client.respond({ model: 'fixture', input: [] }, { context });
     const contents = bodies[0].contents;
-    expect(contents).toHaveLength(6);
+    expect(contents).toHaveLength(5);
     expect(contents[1].parts[0].functionResponse.response.result).toContain('first event');
-    expect(contents[2].parts).toEqual([{ inlineData: { mimeType: 'application/pdf', data: pdf.toString('base64') } }]);
-    expect(contents[3].parts[0]).toEqual({ text: 'first answer' });
-    expect(contents[4].parts[0].functionResponse.response.result).toContain('second event');
-    expect(contents[5].parts).toEqual([{ inlineData: { mimeType: 'audio/wav', data: wav.toString('base64') } }]);
+    expect(JSON.stringify(contents)).not.toContain(pdf.toString('base64'));
+    expect(contents[2].parts[0]).toEqual({ text: 'first answer' });
+    expect(contents[3].parts[0].functionResponse.response.result).toContain('second event');
+    expect(contents[4].parts).toEqual([{ inlineData: { mimeType: 'audio/wav', data: wav.toString('base64') } }]);
   });
 
   it('retries rejected Gemini tool-result media as text once and keeps its quarantine on replay', async () => {
