@@ -11,16 +11,15 @@
  */
 import type { Logger, ModelSpec } from 'cortico/core/types.ts';
 import { nullLogger } from 'cortico/core/util.ts';
-import type { GenerateOptions } from 'cortico/core/generation.ts';
+import type { GenerateOptions, Generation, TokenMeters } from 'cortico/core/generation.ts';
 import type { Request, Response, StreamEvent } from 'cortico/protocol/open-responses/index.ts';
-import type { TokenMeters } from 'cortico/core/generation.ts';
 import { OpenAIHttpClient } from 'cortico/providers/transport/chat.ts';
 import { ChatResponseAssembly, type ResponseAssembly } from 'cortico/providers/transport/response-assembly.ts';
 import { StreamErrorEvent } from 'cortico/providers/transport/errors.ts';
 import type { CompatMediaOptions } from 'cortico/providers/transport/history.ts';
 import { renderMessagesWithMedia } from 'cortico/providers/transport/history.ts';
 import { nativeChatInput, requestContext, requestSpec, requestTools } from 'cortico/providers/transport/native-input.ts';
-import { identityHeaders, newSession } from './identity.ts';
+import { RequestIdentity } from './identity.ts';
 import { messagesForcedToolsAllowed, messagesSamplingAllowed, messagesThinking } from './protocol-contract.ts';
 import { parseDataUrl } from './attachments.ts';
 import { chatImageCount, mediaForRequest } from './images.ts';
@@ -359,8 +358,7 @@ export class OpenCodeMessages extends OpenAIHttpClient {
   private readonly apiKeyOf?: () => string | undefined;
   private readonly onKeyRefused?: () => void;
   private readonly media?: CompatMediaOptions;
-  private session = '';
-  private readonly fallback = newSession();
+  private readonly identity = new RequestIdentity();
 
   constructor(opts: MessagesOptions) {
     super(opts.baseUrl, opts.log ?? nullLogger());
@@ -375,8 +373,11 @@ export class OpenCodeMessages extends OpenAIHttpClient {
     this.baseUrl = baseUrl;
   }
 
+  override respond(request: Request, options: GenerateOptions = {}): Promise<Generation> {
+    return this.identity.run(options.sessionId, () => super.respond(request, options));
+  }
+
   protected override buildResponseBody(request: Request, options: GenerateOptions): Record<string, unknown> {
-    this.session = options.sessionId ?? '';
     const body = buildMessagesBody(request, options, this.media);
     // The base builder is unreachable here, and the stream flag is set by it, so this method must set
     // the flag itself or every request goes out unary and the assembly never sees an SSE frame.
@@ -418,7 +419,7 @@ export class OpenCodeMessages extends OpenAIHttpClient {
     return {
       'Content-Type': 'application/json',
       'anthropic-version': ANTHROPIC_VERSION,
-      ...identityHeaders(this.session || this.fallback),
+      ...this.identity.headers(),
       ...(key ? { Authorization: `Bearer ${key}` } : {}),
     };
   }

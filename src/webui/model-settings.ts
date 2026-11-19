@@ -27,6 +27,7 @@ export interface InputCapabilities extends ModelInputs {
 }
 export interface ModelSettings extends ModelInputs {
   automatic: boolean;
+  mirrorGoSpend: boolean | null;
   definitions: PriceDefinition[];
   overrides: PriceDefinition[];
 }
@@ -60,14 +61,16 @@ export function inputCapabilities(entry: LLMProviderEntry, facts?: ModelFacts, m
 /** Automatic display never turns current defaults into frozen custom prices. */
 export function modelSettings(entry: LLMProviderEntry, facts?: ModelFacts, now = new Date().toISOString()): ModelSettings {
   const model = entry.spec?.model ?? '';
-  facts = { ...knownFacts(entry.baseUrl, billingOf(entry), model), ...facts };
-  const defaults = metadataPrice(model, facts, billingOf(entry), now)
-    ?? prices(billingOf(entry), now).find(definition => definition.models.includes(model));
+  const billing = billingOf(entry);
+  facts = { ...knownFacts(entry.baseUrl, billing, model), ...facts };
+  const defaults = metadataPrice(model, facts, billing, now)
+    ?? prices(billing, now).find(definition => definition.models.includes(model));
   const overrides = entry.pricing ?? [];
   const byBasis = new Map<string, PriceDefinition>();
   if (defaults) byBasis.set(defaults.basis, defaults);
   const matching = overrides.filter(definition => definition.models.includes(model) || definition.models.includes('*'));
   for (const definition of matching) byBasis.set(definition.basis, definition);
   const { accepts: _accepts, ...inputs } = inputCapabilities(entry, facts);
-  return { ...inputs, automatic: !matching.length, definitions: [...byBasis.values()], overrides };
+  const mirrorGoSpend = billing === 'go' ? optionsOf(entry).mirrorGoSpend === true : null;
+  return { ...inputs, automatic: !matching.length, mirrorGoSpend, definitions: [...byBasis.values()], overrides };
 }

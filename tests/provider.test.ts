@@ -3,12 +3,19 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { dryMountProvider } from 'cortico/extensions/dry-mount.ts';
+import { aggregateUsage } from 'cortico/core/cost.ts';
+import { CORE_DEFAULTS } from 'cortico/core/config.ts';
+import { quotePrices, type PriceDefinition } from 'cortico/providers/pricebook.ts';
+import { ProviderRegistry } from 'cortico/providers/registry.ts';
+import { ProviderHub } from 'cortico/providers/webui/hub.ts';
+import { ProviderSettings } from 'cortico/providers/webui/settings.ts';
 import type { LLMProviderEntry } from 'cortico/core/types.ts';
 import type { ProviderHost } from 'cortico/providers/base.ts';
 import type { ProviderWebUiHost } from 'cortico/providers/webui/types.ts';
 import type { GenerateOptions } from 'cortico/core/generation.ts';
 import type { Request } from 'cortico/protocol/open-responses/index.ts';
 import { message } from 'cortico/protocol/open-responses/context.ts';
+import { usageCounters } from 'cortico/protocol/open-responses/context-helpers.ts';
 import OPENCODE, { BILLING_OPTIONS, DEFAULT_BILLING, billingOf, protocolOf } from '../src/index.ts';
 import { DEFAULT_PROTOCOL, keyNamesOf } from '../src/options.ts';
 import { createKeyCursor } from '../src/rotation.ts';
@@ -21,12 +28,14 @@ import { buildMessagesBody, MessagesAssembly } from '../src/anthropic.ts';
 import { buildGeminiBody, GeminiAssembly, parseGeminiResponse } from '../src/gemini.ts';
 import { SignatureStore } from '../src/signatures.ts';
 import { opencodeWebUi, ALLOWANCE_PANEL } from '../src/webui/server.ts';
+import { MODEL_SETTINGS_PANEL } from '../src/webui/model-settings.ts';
 import { OpenCodeChat, OpenCodeResponses, SpendLedger } from '../src/native.ts';
 import { guardedMedia, type DroppedImage } from '../src/images.ts';
 import { createCatalog, pickFacts } from '../src/catalog.ts';
 import { readUsage } from '../src/usage.ts';
+import type { UsageControl } from '../src/usage.ts';
 import { createServer } from 'node:http';
-import { writeFileSync } from 'node:fs';
+import { mkdirSync, writeFileSync } from 'node:fs';
 
 let scratchDir: string;
 beforeEach(() => { scratchDir = mkdtempSync(join(tmpdir(), 'opencode-provider-')); });
@@ -274,6 +283,91 @@ describe('prices', () => {
   it('prices a balance request as money spent and a Go request as allowance consumed', () => {
     expect(prices('balance', at).every((definition) => definition.basis === 'marginal')).toBe(true);
     expect(prices('go', at).every((definition) => definition.basis === 'equivalent')).toBe(true);
+  });
+
+  it('mirrors the effective Go quote on opt-in and preserves manual marginal prices', () => {
+    const request = { model: 'gemini-4-argon' };
+    const time = { startedAt: at, requestedServiceTier: null };
+    const quotes = (connection: LLMProviderEntry, model = request.model) =>
+      quotePrices(connection, { model }, time, OPENCODE.prices(connection, { model }, time));
+    const enabled = entry({ options: { mirrorGoSpend: true } });
+    expect(quotes(entry()).map(q => q.basis)).toEqual(['equivalent']);
+    expect(quotes(enabled).map(q => q.basis)).toEqual(['equivalent', 'marginal']);
+    expect(quotes({ ...enabled, options: { ...enabled.options, billing: 'balance' } }).map(q => q.basis)).toEqual(['marginal']);
+    expect(quotes(enabled, 'unknown-model')).toEqual([]);
+
+    const custom: PriceDefinition = {
+      models: ['*'], currency: 'USD', basis: 'equivalent', source: 'custom', rules: [{ meter: 'output', perMillion: 8 }],
+      inputBands: [{ from: 100, rules: [{ meter: 'output', perMillion: 20 }] }],
+    };
+    const overridden = { ...enabled, pricing: [custom] };
+    const [equivalent, mirrored] = quotes(overridden);
+    expect(mirrored).toMatchObject({ rules: equivalent.rules, inputBands: equivalent.inputBands });
+    expect(mirrored.source).toContain('OpenCode Go subscription estimate');
+    const marginal: PriceDefinition = { ...custom, basis: 'marginal', rules: [{ meter: 'output', perMillion: 3 }] };
+    expect(quotes({ ...overridden, pricing: [custom, marginal] })[1]).toMatchObject({ source: 'custom', rules: marginal.rules });
+  });
+
+  it('saves the Go report setting in the endpoint draft and prices new host calls without doubling allowance', async () => {
+    const model = 'gemini-4-argon';
+    let connection = entry({ spec: { model, thinking: false } });
+    const panel = opencodeWebUi({
+      language: 'zh', editing: true, entries: () => [{ name: 'test', entry: connection }],
+      instance: () => ({ client: {} as never }), save: (_name, next) => { connection = next; },
+    });
+    const setting = (enabled: unknown) => panel.invoke!(MODEL_SETTINGS_PANEL, 'pricing-mirror', [{ name: 'test', model, enabled }]);
+    await expect(setting('true')).rejects.toThrow('Invalid Go estimate setting');
+    await expect(setting(true)).resolves.toMatchObject({ mirrorGoSpend: true });
+    expect(connection.options?.mirrorGoSpend).toBe(true);
+    expect(connection.pricing).toBeUndefined();
+
+    const registry = new ProviderRegistry(() => ({ test: connection }), { ...host(), stateRoot: scratchDir }, [OPENCODE], { OPENCODE_KEY: 'test-key' });
+    const fetch = vi.fn(async () => Response.json({
+      id: 'chat_pricing', model, choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 5000, completion_tokens: 1000, total_tokens: 6000, prompt_tokens_details: { cached_tokens: 0 }, cost: 0 },
+    }));
+    vi.stubGlobal('fetch', fetch);
+    try {
+      const { attempts: [attempt] } = await registry.bind('test').respond!({ model, input: 'hello' });
+      expect(fetch).toHaveBeenCalledOnce();
+      expect(attempt.charges).toHaveLength(2);
+      const amount = attempt.charges.find(charge => charge.quote.basis === 'equivalent')?.amount;
+      expect(amount).toBeCloseTo(.02);
+      expect((registry.resolve('test').control as UsageControl).spend()[model]).toBeCloseTo(.02);
+      const usage = usageCounters(attempt.meters);
+      const rows = [{ ...usage, reasoningTokens: usage.reasoningTokens ?? 0, attempt, model, ts: attempt.startedAt, sessionId: 'main', role: 'main', label: 'main' }];
+      expect(aggregateUsage(rows, { bucket: 'day' }).totals.cost).toBeCloseTo(.02);
+      expect(aggregateUsage(rows, { bucket: 'day', basis: 'equivalent' }).totals.cost).toBeCloseTo(.02);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('defaults new Go editor drafts to mirroring and preserves saved choices', async () => {
+    const root = join(scratchDir, 'providers');
+    const configFile = join(scratchDir, 'config.json');
+    mkdirSync(root);
+    writeFileSync(configFile, '{}');
+    const config = structuredClone(CORE_DEFAULTS);
+    const registry = new ProviderRegistry(() => config.providers, { ...host(), stateRoot: root }, [OPENCODE]);
+    const settings = new ProviderSettings(config, registry, configFile, root, [OPENCODE]);
+    const hub = new ProviderHub(config, registry, settings, configFile, root, [OPENCODE]);
+    const fresh = { kind: 'opencode', baseUrl: OPENCODE.defaultBaseUrl, spec: { model: '', thinking: false } };
+    const preview = (connection: LLMProviderEntry) => hub.preview('draft', connection, MODEL_SETTINGS_PANEL, 'pricing-state', [{ name: 'draft' }], 'en');
+
+    const draft = await preview(fresh);
+    expect(draft.result).toMatchObject({ mirrorGoSpend: true });
+    expect(draft.entry.options).toEqual({ mirrorGoSpend: true });
+    expect(hub.list('en').providers).toHaveLength(0);
+    const spec = { model: 'gemini-4-argon', thinking: false };
+    const saved = hub.save(null, { name: 'Go', entry: { ...draft.entry, spec }, secretValue: 'fixture-key' }, 'en');
+    expect(saved.quotes[0].quotes.map(quote => quote.basis)).toEqual(['equivalent', 'marginal']);
+
+    const disabled = await hub.preview('draft', draft.entry, MODEL_SETTINGS_PANEL, 'pricing-mirror', [{ name: 'draft', enabled: false }], 'en');
+    expect((await preview(disabled.entry)).entry.options).toEqual({ mirrorGoSpend: false });
+    const legacy = hub.save(null, { name: 'draft', entry: { ...fresh, spec }, secretValue: 'fixture-key' }, 'en');
+    expect((await preview(legacy.entry)).result).toMatchObject({ mirrorGoSpend: false });
+    expect((await preview({ ...fresh, baseUrl: 'https://opencode.ai/inference/openai/v1' })).result).toMatchObject({ mirrorGoSpend: null });
   });
 
   it('keeps the two pages apart, because they list different models at different rates', () => {

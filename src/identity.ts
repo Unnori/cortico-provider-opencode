@@ -1,9 +1,11 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
+
 /**
  * How this package identifies itself to the gateway. OpenCode asks clients to name themselves rather
  * than look like a generic SDK, and to send a stable session id so it can route and cache prompts —
  * the Go endpoints refuse a request that carries none, so one is always sent.
  */
-export const USER_AGENT = 'cortico-provider-opencode/0.7.1';
+export const USER_AGENT = 'cortico-provider-opencode/0.7.2';
 export const SESSION_HEADER = 'x-opencode-session';
 
 /**
@@ -28,4 +30,19 @@ const PROBE_SESSION = newSession();
 export function identityHeaders(session: string): Record<string, string> {
   const id = typeof session === 'string' && session.trim() ? session.trim() : PROBE_SESSION;
   return { 'User-Agent': USER_AGENT, [SESSION_HEADER]: id };
+}
+
+/** The HTTP transport asks for headers again on retry, after other requests may have started. */
+export class RequestIdentity {
+  private readonly session = new AsyncLocalStorage<string>();
+  private readonly fallback = newSession();
+
+  run<T>(session: string | undefined, send: () => T): T {
+    const id = typeof session === 'string' ? session.trim() : '';
+    return this.session.run(id || this.fallback, send);
+  }
+
+  headers(): Record<string, string> {
+    return identityHeaders(this.session.getStore() ?? this.fallback);
+  }
 }

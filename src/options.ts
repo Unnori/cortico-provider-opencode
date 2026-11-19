@@ -35,6 +35,8 @@ export interface OpenCodeOptions {
   inputVideo?: boolean;
   inputFiles?: boolean;
   goPlan?: 'go' | 'go-plus' | 'go-teams';
+  /** Also report the Go estimate under the host's marginal cost basis. */
+  mirrorGoSpend?: boolean;
   /** Unset: `go`. */
   billing?: Billing;
   /**

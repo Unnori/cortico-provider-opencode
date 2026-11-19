@@ -19,7 +19,7 @@ import type { NativeChatMessage } from 'cortico/providers/transport/native-types
 import type { Protocol } from './address.ts';
 import { OpenCodeMessages } from './anthropic.ts';
 import { OpenCodeGemini } from './gemini.ts';
-import { identityHeaders, newSession } from './identity.ts';
+import { RequestIdentity } from './identity.ts';
 import { DEFAULT_EFFORT } from './options.ts';
 import type { LocalSpend } from './usage.ts';
 import { GenerationError } from 'cortico/core/generation.ts';
@@ -42,19 +42,13 @@ export interface ClientOptions {
   media?: CompatMediaOptions;
 }
 
-/**
- * Chat Completions. The session id arrives with each request body; `headers` runs right after it in the
- * same attempt, so the field carries the id across. A concurrent request on the same endpoint can
- * overwrite it, which costs nothing more than a routing hint.
- */
+/** Chat Completions with the gateway identity scoped to each request. */
 export class OpenCodeChat extends OpenAIHttpClient {
   private readonly apiKey?: string;
   private readonly apiKeyOf?: () => string | undefined;
   private readonly onKeyRefused?: () => void;
   private readonly media?: CompatMediaOptions;
-  private session = '';
-  /** The probe carries no conversation id, and the gateway refuses a request without one. */
-  private readonly fallback = newSession();
+  private readonly identity = new RequestIdentity();
 
   constructor(opts: ClientOptions) {
     super(opts.baseUrl, opts.log ?? nullLogger());
@@ -83,8 +77,11 @@ export class OpenCodeChat extends OpenAIHttpClient {
     return this.apiKeyOf?.() ?? this.apiKey;
   }
 
-  protected buildBody(spec: ModelSpec, messages: NativeChatMessage[], tools?: ToolSchema[], sessionId?: string): Record<string, unknown> {
-    this.session = sessionId ?? '';
+  override respond(request: Request, options: GenerateOptions = {}): Promise<Generation> {
+    return this.identity.run(options.sessionId, () => super.respond(request, options));
+  }
+
+  protected buildBody(spec: ModelSpec, messages: NativeChatMessage[], tools?: ToolSchema[]): Record<string, unknown> {
     const body: Record<string, unknown> = {
       model: spec.model,
       messages: chatToolMedia(chatMediaParts(renderMessagesWithMedia(messages, mediaForRequest(this.media, chatImageCount(messages))))),
@@ -103,7 +100,7 @@ export class OpenCodeChat extends OpenAIHttpClient {
     const key = this.key();
     return {
       'Content-Type': 'application/json',
-      ...identityHeaders(this.session || this.fallback),
+      ...this.identity.headers(),
       ...(key ? { Authorization: `Bearer ${key}` } : {}),
     };
   }
@@ -111,8 +108,7 @@ export class OpenCodeChat extends OpenAIHttpClient {
 
 /** Native Responses, with the same identity headers. */
 export class OpenCodeResponses extends ResponsesProvider {
-  private session = '';
-  private readonly fallback = newSession();
+  private readonly identity = new RequestIdentity();
   private readonly apiKeyOf?: () => string | undefined;
   private readonly onKeyRefused?: () => void;
   private readonly responseOptions: ResponsesProviderOptions;
@@ -135,8 +131,11 @@ export class OpenCodeResponses extends ResponsesProvider {
     return true;
   }
 
+  override respond(request: Request, options: GenerateOptions = {}): Promise<Generation> {
+    return this.identity.run(options.sessionId, () => super.respond(request, options));
+  }
+
   protected override buildResponseBody(request: Request, options: GenerateOptions): Record<string, unknown> {
-    this.session = options.sessionId ?? '';
     const opts = this.responseOptions;
     return buildResponsesBody(request, options, {
       media: mediaForRequest(opts.media, requestImageCount(request, options)),
@@ -153,15 +152,15 @@ export class OpenCodeResponses extends ResponsesProvider {
     const withKey = key ? { ...inherited, Authorization: `Bearer ${key}` } : inherited;
     return {
       ...withKey,
-      ...identityHeaders(this.session || this.fallback),
+      ...this.identity.headers(),
     };
   }
 }
 
 /**
  * Dollars this process spent per model, so the allowance bars can move between the gateway's reads.
- * The transport already prices each attempt against the endpoint's quote, so the sum of those charges
- * is the figure; an attempt whose charge is unknown contributes nothing rather than a guess.
+ * Go's equivalent USD charges track allowance consumption. A charge whose amount is unknown
+ * contributes nothing rather than a guess.
  */
 export class SpendLedger {
   private readonly byModel = new Map<string, number>();
@@ -282,7 +281,7 @@ export class OpenCodeProvider extends BaseProvider {
     let known = false;
     for (const attempt of generation.attempts) {
       for (const charge of attempt.charges ?? []) {
-        if (charge.amount === null) continue;
+        if (charge.quote.basis !== 'equivalent' || charge.quote.currency !== 'USD' || charge.amount === null) continue;
         usd += charge.amount;
         known = true;
       }

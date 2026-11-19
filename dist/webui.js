@@ -16,6 +16,9 @@ var modelPanel = {
     const info = ui.h("p", "tdesc", en2 ? "USD per million tokens. Automatic rates follow this model and account. Changes are saved with the connection." : "\u5355\u4F4D\uFF1AUSD / \u767E\u4E07 token\u3002\u81EA\u52A8\u4EF7\u683C\u968F\u6A21\u578B\u548C\u8D26\u6237\u66F4\u65B0\uFF0C\u4FEE\u6539\u968F\u7AEF\u70B9\u4FDD\u5B58\u3002");
     const status = ui.msgline();
     const fields = ui.h("div", "opencode-pricing");
+    const mirror = ui.h("div");
+    const mirrorTitle = en2 ? "Show Go estimates under Actual spend" : ctx.language === "zh-Hant" ? "\u540C\u6B65 Go \u6298\u7B97\u984D\u5230\u300C\u5BE6\u969B\u652F\u51FA\u300D" : "\u540C\u6B65 Go \u6298\u7B97\u989D\u5230\u300C\u5B9E\u9645\u652F\u51FA\u300D";
+    const mirrorHint = en2 ? "Applies to new calls. The amount is a subscription estimate. Manual Actual spend rates take precedence." : ctx.language === "zh-Hant" ? "\u5C0D\u65B0\u547C\u53EB\u751F\u6548\u3002\u91D1\u984D\u70BA\u8A02\u95B1\u4F30\u7B97\uFF0C\u624B\u52D5\u8A2D\u5B9A\u7684\u5BE6\u969B\u652F\u51FA\u8CBB\u7387\u512A\u5148\u3002" : "\u5BF9\u65B0\u8C03\u7528\u751F\u6548\u3002\u91D1\u989D\u4E3A\u8BA2\u9605\u4F30\u7B97\uFF0C\u624B\u52A8\u8BBE\u7F6E\u7684\u5B9E\u9645\u652F\u51FA\u8D39\u7387\u4F18\u5148\u3002";
     const advanced = ui.h("details", "pricing-rules");
     const raw = ui.textarea({ rows: 10, cls: "mono" });
     raw.setAttribute("aria-label", en2 ? "Full pricing rules" : "\u5B8C\u6574\u8BA1\u4EF7\u89C4\u5219");
@@ -24,7 +27,7 @@ var modelPanel = {
     const actions = ui.rowbar();
     actions.append(reset, status);
     advanced.append(ui.h("summary", null, en2 ? "Full pricing rules (JSON)" : "\u5B8C\u6574\u8BA1\u4EF7\u89C4\u5219\uFF08JSON\uFF09"), raw, apply);
-    sheet.body.append(label, switches, formatDetails, info, fields, actions, advanced);
+    sheet.body.append(label, switches, formatDetails, info, mirror, fields, actions, advanced);
     let state;
     let fingerprint = "";
     let busy = false;
@@ -71,8 +74,20 @@ var modelPanel = {
           wrapper.classList.add("connection-toggle");
           wrapper.title = title;
           wrapper.style.cssText = "display:flex;align-items:center;gap:10px;margin:0";
-          toggle.addEventListener("change", () => void saveInput(setting.kind, toggle), { signal: ctx.signal });
+          toggle.addEventListener("change", () => void saveSwitch("input-save", toggle, { kind: setting.kind }), { signal: ctx.signal });
           switches.append(wrapper);
+        }
+        mirror.replaceChildren();
+        if (typeof next.mirrorGoSpend === "boolean") {
+          const toggle = ui.h("input", "connection-switch");
+          toggle.type = "checkbox";
+          toggle.checked = next.mirrorGoSpend;
+          toggle.setAttribute("role", "switch");
+          toggle.setAttribute("aria-label", mirrorTitle);
+          toggle.addEventListener("change", () => void saveSwitch("pricing-mirror", toggle), { signal: ctx.signal });
+          const wrapper = ui.field(mirrorTitle, toggle);
+          wrapper.classList.add("connection-toggle");
+          mirror.append(wrapper, ui.h("p", "tdesc", mirrorHint));
         }
         fields.replaceChildren();
         for (const [index, definition] of next.definitions.entries()) {
@@ -113,7 +128,7 @@ var modelPanel = {
         busy = false;
       }
     }
-    async function saveInput(kind, toggle) {
+    async function saveSwitch(method, toggle, args = {}) {
       if (!state || saving) {
         toggle.checked = !toggle.checked;
         return;
@@ -121,7 +136,7 @@ var modelPanel = {
       saving = true;
       toggle.disabled = true;
       try {
-        await ctx.invoke("input-save", [{ name: ctx.scope.instance, model: state.model, kind, enabled: toggle.checked }]);
+        await ctx.invoke(method, [{ ...args, name: ctx.scope.instance, model: state.model, enabled: toggle.checked }]);
         fingerprint = "";
         status.textContent = en2 ? "Connection draft updated" : "\u5DF2\u66F4\u65B0\u7AEF\u70B9\u8349\u7A3F";
         status.classList.remove("bad");

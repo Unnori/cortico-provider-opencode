@@ -18,7 +18,7 @@ import { ChatResponseAssembly, type ResponseAssembly } from 'cortico/providers/t
 import { StreamErrorEvent } from 'cortico/providers/transport/errors.ts';
 import { renderMessagesWithMedia, type CompatMediaOptions } from 'cortico/providers/transport/history.ts';
 import { nativeChatInput, requestSpec, requestTools } from 'cortico/providers/transport/native-input.ts';
-import { identityHeaders, newSession } from './identity.ts';
+import { RequestIdentity } from './identity.ts';
 import { geminiThinking } from './protocol-contract.ts';
 import { SignatureStore } from './signatures.ts';
 import { parseDataUrl } from './attachments.ts';
@@ -298,8 +298,7 @@ export class OpenCodeGemini extends OpenAIHttpClient {
   private readonly apiKeyOf?: () => string | undefined;
   private readonly onKeyRefused?: () => void;
   private readonly media?: CompatMediaOptions;
-  private session = '';
-  private readonly fallback = newSession();
+  private readonly identity = new RequestIdentity();
   /** Survives across rounds: the registry reuses one instance per endpoint (registry.ts keeps a cache). */
   private readonly signatures = new SignatureStore();
 
@@ -315,11 +314,10 @@ export class OpenCodeGemini extends OpenAIHttpClient {
   override respond(request: Request, options: GenerateOptions = {}): Promise<Generation> {
     const method = options.onEvent ? 'streamGenerateContent?alt=sse' : 'generateContent';
     this.chatPath = `/models/${encodeURIComponent(request.model ?? '')}:${method}`;
-    return super.respond(request, options);
+    return this.identity.run(options.sessionId, () => super.respond(request, options));
   }
 
   protected override buildResponseBody(request: Request, options: GenerateOptions): Record<string, unknown> {
-    this.session = options.sessionId ?? '';
     return buildGeminiBody(request, options, this.media, this.signatures);
   }
 
@@ -357,7 +355,7 @@ export class OpenCodeGemini extends OpenAIHttpClient {
     const key = this.key();
     return {
       'Content-Type': 'application/json',
-      ...identityHeaders(this.session || this.fallback),
+      ...this.identity.headers(),
       ...(key ? { Authorization: `Bearer ${key}` } : {}),
     };
   }

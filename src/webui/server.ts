@@ -90,10 +90,23 @@ export function opencodeWebUi(host: ProviderWebUiHost): Partial<WebUiPageContrib
           if (!Array.isArray(mimes) || mimes.length > 128 || mimes.some(mime => typeof mime !== 'string' || !mime.includes('/') || mime.length > 256)) throw new Error('Invalid MIME query');
           return inputCapabilities(entry, facts, mimes);
         }
-        if (method === 'pricing-state') return modelSettings(entry, facts);
+        if (method === 'pricing-state') {
+          // The connection editor uses "draft" for new entries. Saved OpenCode entries
+          // already have an options object, even when no setting was explicitly chosen.
+          if (host.editing && name === 'draft' && entry.options === undefined && billingOf(entry) === 'go') {
+            const draft = { ...entry, options: { mirrorGoSpend: true } };
+            host.save(name, draft);
+            return modelSettings(draft, facts);
+          }
+          return modelSettings(entry, facts);
+        }
         const raw = args[0] as { model?: unknown; definitions?: unknown };
-        if (raw.model !== entry.spec?.model) throw new Error('Model changed; refresh pricing before applying');
-        if (method === 'input-save') {
+        if (method !== 'pricing-mirror' && raw.model !== entry.spec?.model) throw new Error('Model changed; refresh pricing before applying');
+        if (method === 'pricing-mirror') {
+          const { enabled } = args[0] as { enabled?: unknown };
+          if (billingOf(entry) !== 'go' || typeof enabled !== 'boolean') throw new Error('Invalid Go estimate setting');
+          host.save(name, { ...entry, options: { ...entry.options, mirrorGoSpend: enabled } });
+        } else if (method === 'input-save') {
           const value = args[0] as { kind?: unknown; enabled?: unknown };
           if (!['image', 'audio', 'video', 'file'].includes(String(value.kind)) || typeof value.enabled !== 'boolean') throw new Error('Invalid input setting');
           const state = modelSettings(entry, facts);

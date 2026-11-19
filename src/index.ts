@@ -109,8 +109,9 @@ export const OPENCODE = {
   config: (name: string, _entry: LLMProviderEntry, language: Language) => [optionsGroup(name, language)],
   validateEntry: (entry: LLMProviderEntry, language: Language) => {
     const t = opencodeText(language);
-    const { protocol, billing } = optionsOf(entry);
+    const { protocol, billing, mirrorGoSpend } = optionsOf(entry);
     if (protocol !== undefined && !PROTOCOLS.includes(protocol)) throw new Error(t.badProtocol(PROTOCOLS.join(' / ')));
+    if (mirrorGoSpend !== undefined && typeof mirrorGoSpend !== 'boolean') throw new Error('mirrorGoSpend: boolean required');
     if (optionsOf(entry).attachments !== undefined && !['auto', 'off'].includes(optionsOf(entry).attachments!)) throw new Error('attachments: auto / off');
     if (optionsOf(entry).goPlan !== undefined && !['go', 'go-plus', 'go-teams'].includes(optionsOf(entry).goPlan!)) throw new Error('goPlan: go / go-plus / go-teams');
     for (const key of ['inputAudio', 'inputVideo', 'inputFiles'] as const) {
@@ -124,9 +125,27 @@ export const OPENCODE = {
     audio: optionsOf(entry).inputAudio, video: optionsOf(entry).inputVideo, files: optionsOf(entry).inputFiles,
   }, mime),
   prices: (entry: LLMProviderEntry, request, at) => {
-    const defaults = prices(billingOf(entry), at.startedAt);
-    const live = metadataPrice(request.model ?? '', knownFacts(entry.baseUrl, billingOf(entry), request.model ?? ''), billingOf(entry), at.startedAt);
-    return live ? [...defaults.filter(price => !price.models.includes(request.model ?? '')), live] : defaults;
+    const billing = billingOf(entry);
+    const model = request.model ?? '';
+    const builtIn = prices(billing, at.startedAt);
+    const live = metadataPrice(model, knownFacts(entry.baseUrl, billing, model), billing, at.startedAt);
+    const defaults = live ? [...builtIn.filter(price => !price.models.includes(model)), live] : builtIn;
+    if (billing !== 'go' || optionsOf(entry).mirrorGoSpend !== true || !model) return defaults;
+
+    // Follow the same last matching override as Core and leave explicit marginal quotes to Core.
+    let equivalent = live ?? defaults.find(price => price.models.includes(model));
+    for (const definition of entry.pricing ?? []) {
+      if (!definition.models.includes(model) && !definition.models.includes('*')) continue;
+      if (definition.basis === 'marginal') return defaults;
+      equivalent = definition;
+    }
+    if (!equivalent) return defaults;
+    return [...defaults, {
+      ...equivalent,
+      models: [model],
+      basis: 'marginal',
+      source: `OpenCode Go subscription estimate · ${equivalent.source}`,
+    }];
   },
   contextOverflow: isContextOverflow,
   webUi: opencodeWebUi,

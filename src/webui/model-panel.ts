@@ -20,6 +20,11 @@ export const modelPanel: WebUiPanel = {
       : '单位：USD / 百万 token。自动价格随模型和账户更新，修改随端点保存。');
     const status = ui.msgline();
     const fields = ui.h('div', 'opencode-pricing');
+    const mirror = ui.h('div');
+    const mirrorTitle = en ? 'Show Go estimates under Actual spend' : ctx.language === 'zh-Hant'
+      ? '同步 Go 折算額到「實際支出」' : '同步 Go 折算额到「实际支出」';
+    const mirrorHint = en ? 'Applies to new calls. The amount is a subscription estimate. Manual Actual spend rates take precedence.' : ctx.language === 'zh-Hant'
+      ? '對新呼叫生效。金額為訂閱估算，手動設定的實際支出費率優先。' : '对新调用生效。金额为订阅估算，手动设置的实际支出费率优先。';
     const advanced = ui.h('details', 'pricing-rules');
     const raw = ui.textarea({ rows: 10, cls: 'mono' });
     raw.setAttribute('aria-label', en ? 'Full pricing rules' : '完整计价规则');
@@ -27,7 +32,7 @@ export const modelPanel: WebUiPanel = {
     const reset = ui.button(en ? 'Use automatic prices' : '恢复自动价格', { onClick: () => void resetPrices() });
     const actions = ui.rowbar(); actions.append(reset, status);
     advanced.append(ui.h('summary', null, en ? 'Full pricing rules (JSON)' : '完整计价规则（JSON）'), raw, apply);
-    sheet.body.append(label, switches, formatDetails, info, fields, actions, advanced);
+    sheet.body.append(label, switches, formatDetails, info, mirror, fields, actions, advanced);
     let state: ModelSettings | undefined;
     let fingerprint = '';
     let busy = false;
@@ -69,8 +74,20 @@ export const modelPanel: WebUiPanel = {
           const wrapper = ui.field(inputLabels[setting.kind], toggle);
           wrapper.classList.add('connection-toggle'); wrapper.title = title;
           wrapper.style.cssText = 'display:flex;align-items:center;gap:10px;margin:0';
-          toggle.addEventListener('change', () => void saveInput(setting.kind, toggle), { signal: ctx.signal });
+          toggle.addEventListener('change', () => void saveSwitch('input-save', toggle, { kind: setting.kind }), { signal: ctx.signal });
           switches.append(wrapper);
+        }
+        mirror.replaceChildren();
+        if (typeof next.mirrorGoSpend === 'boolean') {
+          const toggle = ui.h('input', 'connection-switch');
+          toggle.type = 'checkbox';
+          toggle.checked = next.mirrorGoSpend;
+          toggle.setAttribute('role', 'switch');
+          toggle.setAttribute('aria-label', mirrorTitle);
+          toggle.addEventListener('change', () => void saveSwitch('pricing-mirror', toggle), { signal: ctx.signal });
+          const wrapper = ui.field(mirrorTitle, toggle);
+          wrapper.classList.add('connection-toggle');
+          mirror.append(wrapper, ui.h('p', 'tdesc', mirrorHint));
         }
         fields.replaceChildren();
         for (const [index, definition] of next.definitions.entries()) {
@@ -103,11 +120,11 @@ export const modelPanel: WebUiPanel = {
       } catch (error) { report(error); }
       finally { busy = false; }
     }
-    async function saveInput(kind: InputKind, toggle: HTMLInputElement) {
+    async function saveSwitch(method: 'input-save' | 'pricing-mirror', toggle: HTMLInputElement, args = {}) {
       if (!state || saving) { toggle.checked = !toggle.checked; return; }
       saving = true; toggle.disabled = true;
       try {
-        await ctx.invoke('input-save', [{ name: ctx.scope.instance, model: state.model, kind, enabled: toggle.checked }]);
+        await ctx.invoke(method, [{ ...args, name: ctx.scope.instance, model: state.model, enabled: toggle.checked }]);
         fingerprint = ''; status.textContent = en ? 'Connection draft updated' : '已更新端点草稿'; status.classList.remove('bad');
       } catch (error) { toggle.checked = !toggle.checked; report(error); }
       finally { saving = false; toggle.disabled = false; }
