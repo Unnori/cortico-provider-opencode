@@ -1,11 +1,37 @@
-import { priceUsage, type Generation } from 'cortico/core/generation.ts';
+import { priceUsage, type Generation, type PriceRule, type ProviderAttempt } from 'cortico/core/generation.ts';
+import { snapshotPrice } from 'cortico/providers/pricebook.ts';
 
-/** Preserve the gateway's billed token breakdown; missing categories remain unknown. */
-export function applyGatewayMeters(generation: Generation, mediaTypes: ReadonlySet<string> = new Set()): void {
+const count = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value) && value >= 0;
+const BALANCE_METER = 'opencode_balance_charge';
+
+function reconcileCharges(attempt: ProviderAttempt, reported: number | undefined): void {
+  const quotes = attempt.charges.map(charge => charge.quote)
+    .filter(quote => reported === undefined || quote.basis !== 'marginal');
+  attempt.charges = priceUsage(attempt.meters, quotes, attempt.serviceTier);
+  if (reported === undefined) return;
+
+  // The gateway reports the total in USD. Preserve it without allocating it to token lines.
+  const rule = { meter: `detail:${BALANCE_METER}`, perMillion: 1_000_000, unit: 'USD' } satisfies PriceRule;
+  const details = attempt.meters.details ??= {};
+  details[BALANCE_METER] = { quantity: reported, unit: rule.unit };
+  const quote = snapshotPrice({
+    models: [attempt.origin.model], currency: 'USD', basis: 'marginal',
+    source: 'OpenCode reported balance charge', rules: [rule],
+  }, { startedAt: attempt.startedAt, requestedServiceTier: attempt.requestedServiceTier ?? null });
+  attempt.charges.push({
+    quote, amount: reported, knownAmount: reported, missing: [],
+    lines: [{ ...rule, quantity: reported, amount: reported }],
+  });
+}
+
+/** Preserve the gateway's billed token breakdown and settle balance charges from its usage. */
+export function applyGatewayMeters(generation: Pick<Generation, 'attempts'>, mediaTypes: ReadonlySet<string> = new Set()): void {
   for (const attempt of generation.attempts) {
     const raw = attempt.meters.native as Record<string, any> | null;
-    const tokens = raw?.opencode?.tokens;
-    const count = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value) && value >= 0;
+    const gateway = raw?.opencode;
+    const tokens = gateway?.tokens;
+    const reported = gateway?.billing_source === 'balance' && gateway.estimated !== true && count(raw?.cost)
+      ? raw.cost : undefined;
     const meters = attempt.meters;
     const details = { ...meters.details };
     for (const modality of ['audio', 'image', 'video']) if (!mediaTypes.has(modality)) {
@@ -13,7 +39,7 @@ export function applyGatewayMeters(generation: Generation, mediaTypes: ReadonlyS
     }
     meters.details = details;
     if (!tokens || typeof tokens !== 'object') {
-      attempt.charges = priceUsage(meters, attempt.charges.map(charge => charge.quote), attempt.serviceTier);
+      reconcileCharges(attempt, reported);
       continue;
     }
     if (count(tokens.input)) meters.uncachedInput = tokens.input;
@@ -32,12 +58,10 @@ export function applyGatewayMeters(generation: Generation, mediaTypes: ReadonlyS
       const value = tokens[`${direction}_${modality}`] ?? tokens[`${modality}_${direction}`];
       if (count(value)) details[`${modality}_${direction}`] = { quantity: value, unit: 'token' };
     }
-    meters.details = details;
     if (count(meters.uncachedInput) && count(meters.cachedInput)) {
       meters.input = meters.uncachedInput + meters.cachedInput + (details.cache_write?.quantity ?? 0);
       if (count(meters.output)) meters.total = meters.input + meters.output;
     }
-    // Reconcile against the same request-time quote, never a later price table.
-    attempt.charges = priceUsage(meters, attempt.charges.map(charge => charge.quote), attempt.serviceTier);
+    reconcileCharges(attempt, reported);
   }
 }

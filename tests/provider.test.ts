@@ -29,7 +29,7 @@ import { buildGeminiBody, GeminiAssembly, parseGeminiResponse } from '../src/gem
 import { SignatureStore } from '../src/signatures.ts';
 import { opencodeWebUi, ALLOWANCE_PANEL } from '../src/webui/server.ts';
 import { MODEL_SETTINGS_PANEL } from '../src/webui/model-settings.ts';
-import { OpenCodeChat, OpenCodeResponses, SpendLedger } from '../src/native.ts';
+import { OpenCodeChat, OpenCodeProvider, OpenCodeResponses, SpendLedger } from '../src/native.ts';
 import { guardedMedia, type DroppedImage } from '../src/images.ts';
 import { createCatalog, pickFacts } from '../src/catalog.ts';
 import { readUsage } from '../src/usage.ts';
@@ -368,6 +368,53 @@ describe('prices', () => {
     const legacy = hub.save(null, { name: 'draft', entry: { ...fresh, spec }, secretValue: 'fixture-key' }, 'en');
     expect((await preview(legacy.entry)).result).toMatchObject({ mirrorGoSpend: false });
     expect((await preview({ ...fresh, baseUrl: 'https://opencode.ai/inference/openai/v1' })).result).toMatchObject({ mirrorGoSpend: null });
+  });
+
+  it.each([false, true])('records a Go balance fallback at the reported charge with mirroring set to %s', async mirrorGoSpend => {
+    const model = 'gemini-4-argon';
+    const request = { model, input: 'hello' };
+    const connection = entry({ options: { mirrorGoSpend } });
+    const ledger = new SpendLedger();
+    const client = new OpenCodeProvider({ baseUrl: 'https://fixture.invalid', protocol: 'chat', ledger, keepThinking: () => false });
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json({
+      id: 'chat_balance', model, choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+      usage: {
+        cost: 0.075, prompt_tokens: 10000, completion_tokens: 1000, total_tokens: 11000,
+        opencode: { billing_source: 'balance', list_cost: 0.075, tokens: { input: 10000, output: 1000, cache_read: 0 } },
+      },
+    })));
+    try {
+      const { attempts: [attempt] } = await client.respond(request, {
+        quote: at => quotePrices(connection, request, at, OPENCODE.prices(connection, request, at)),
+      });
+      expect(attempt.charges.map(charge => charge.quote.basis)).toEqual(['equivalent', 'marginal']);
+      const [estimate, actual] = attempt.charges;
+      expect(actual).toMatchObject({ amount: 0.075, knownAmount: 0.075, missing: [], quote: { currency: 'USD', source: 'OpenCode reported balance charge' } });
+      expect(actual.lines).toMatchObject([{ meter: 'detail:opencode_balance_charge', quantity: 0.075, unit: 'USD', amount: 0.075 }]);
+      expect(estimate.amount).toBeCloseTo(0.03);
+      expect(ledger.snapshot()).toEqual({});
+      const usage = usageCounters(attempt.meters);
+      const rows = [{ ...usage, reasoningTokens: usage.reasoningTokens ?? 0, attempt, model, ts: attempt.startedAt, sessionId: 'main', role: 'main', label: 'main' }];
+      expect(aggregateUsage(rows, { bucket: 'day' }).totals.cost).toBe(0.075);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('keeps a reported balance debit on a failed response before it reaches the host ledger', async () => {
+    const model = 'fixture';
+    const client = new OpenCodeProvider({ baseUrl: 'https://fixture.invalid', protocol: 'responses', keepThinking: () => false });
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json({
+      id: 'resp_failed', model, output: [], status: 'failed', error: { code: 'server_error', message: 'fixture failure' },
+      usage: { cost: 0.0125, opencode: { billing_source: 'balance' } },
+    })));
+    try {
+      await expect(client.respond({ model, input: 'hello' }, { diagnostic: true })).rejects.toMatchObject({
+        attempts: [{ outcome: 'failed', charges: [{ amount: 0.0125, quote: { basis: 'marginal' } }] }],
+      });
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it('keeps the two pages apart, because they list different models at different rates', () => {
@@ -879,7 +926,7 @@ describe('Gemini turn order', () => {
     expect(body.contents.find((turn: any) => turn.role === 'model').parts[0].functionCall.name).toBe('echo');
   });
 });
-describe('Gemini response turns stay alone', () => {
+describe('Gemini tool responses followed by user text', () => {
   const history = (tail: unknown[]) => ({
     model: 'gemini-4-argon',
     input: [
@@ -889,16 +936,16 @@ describe('Gemini response turns stay alone', () => {
     ],
   }) as never;
 
-  it('keeps a functionResponse in its own turn and does not merge the next user text into it', () => {
+  it('appends following user text to the turn containing the tool response', () => {
     const body = buildGeminiBody(history([
       { type: 'function_call_output', call_id: 'call_0', output: 'sent' },
       { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'and again' }] },
     ]), { nativeSpec: { model: 'gemini-4-argon', thinking: false } } as never) as Record<string, any>;
-    const responseTurn = body.contents.find((turn: any) => turn.parts.some((part: any) => 'functionResponse' in part));
-    expect(responseTurn.parts).toHaveLength(1);
-    const after = body.contents[body.contents.length - 1];
-    expect(after.role).toBe('user');
-    expect(after.parts.some((part: any) => 'functionResponse' in part)).toBe(false);
+    expect(body.contents.map((turn: any) => turn.role)).toEqual(['user', 'model', 'user']);
+    expect(body.contents.at(-1).parts).toEqual([
+      { functionResponse: { name: 'qq_send', response: { result: 'sent' } } },
+      { text: 'and again' },
+    ]);
   });
 
   it('leaves a history that ends on a lone functionResponse untouched', () => {
@@ -936,21 +983,27 @@ describe('Gemini parallel tool results', () => {
     expect(turnAfterResponse).toBeUndefined();
   });
 
-  it('never merges a text part into a response turn', () => {
+  it('preserves all parallel responses in order before merging user text', () => {
     const mixed = {
       model: 'gemini-4-argon',
       input: [
         { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'go' }] },
         { type: 'function_call', call_id: 'call_0', name: 'echo', arguments: '{}' },
+        { type: 'function_call', call_id: 'call_1', name: 'report', arguments: '{}' },
         { type: 'function_call_output', call_id: 'call_0', output: 'ok' },
+        { type: 'function_call_output', call_id: 'call_1', output: 'ready' },
         { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'thanks' }] },
+        { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'continue' }] },
       ],
     } as never;
     const body = buildGeminiBody(mixed, { nativeSpec: { model: 'gemini-4-argon', thinking: false } } as never) as Record<string, any>;
-    const responseTurn = body.contents.find((turn: any) => turn.parts.some((part: any) => 'functionResponse' in part));
-    expect(responseTurn.parts).toHaveLength(1);
-    const last = body.contents[body.contents.length - 1];
-    expect(last.parts.some((part: any) => 'text' in part)).toBe(true);
+    expect(body.contents.map((turn: any) => turn.role)).toEqual(['user', 'model', 'user']);
+    expect(body.contents.at(-1).parts).toEqual([
+      { functionResponse: { name: 'echo', response: { result: 'ok' } } },
+      { functionResponse: { name: 'report', response: { result: 'ready' } } },
+      { text: 'thanks' },
+      { text: 'continue' },
+    ]);
   });
 });
 describe('key rotation', () => {
@@ -965,12 +1018,10 @@ describe('key rotation', () => {
   });
 
   it('uses one key alone when only one name is configured and never rotates', () => {
-    let refused = 0;
     const cursor = createKeyCursor({ names: ['A'], read: secrets({ A: 'k1' }) });
     expect(cursor.current()).toEqual({ name: 'A', value: 'k1' });
-    cursor.refuse();
+    expect(cursor.refuse(cursor.current()!)).toBe(false);
     expect(cursor.current()).toEqual({ name: 'A', value: 'k1' });
-    expect(refused).toBe(0);
     expect(cursor.index()).toBe(0);
   });
 
@@ -978,7 +1029,7 @@ describe('key rotation', () => {
     const cursor = createKeyCursor({ names: ['A', 'B'], read: secrets({ A: 'k1', B: 'k2' }) });
     // Priority order: the first key stays in use across every call, which is what keeps the cache warm.
     for (let i = 0; i < 5; i++) expect(cursor.current()?.value).toBe('k1');
-    cursor.refuse();
+    expect(cursor.refuse(cursor.current()!)).toBe(true);
     expect(cursor.current()?.value).toBe('k2');
     expect(cursor.index()).toBe(1);
     for (let i = 0; i < 5; i++) expect(cursor.current()?.value).toBe('k2');
@@ -986,12 +1037,12 @@ describe('key rotation', () => {
 
   it('never goes back to a key it already refused', () => {
     const cursor = createKeyCursor({ names: ['A', 'B', 'C'], read: secrets({ A: 'k1', B: 'k2', C: 'k3' }) });
-    cursor.refuse();
+    expect(cursor.refuse(cursor.current()!)).toBe(true);
     expect(cursor.current()?.value).toBe('k2');
-    cursor.refuse();
+    expect(cursor.refuse(cursor.current()!)).toBe(true);
     expect(cursor.current()?.value).toBe('k3');
     // A refusal means the window is spent; returning early would cost the cache for a blocked key.
-    cursor.refuse();
+    expect(cursor.refuse(cursor.current()!)).toBe(false);
     expect(cursor.current()?.value).toBe('k3');
     expect(cursor.index()).toBe(2);
   });
@@ -999,6 +1050,15 @@ describe('key rotation', () => {
   it('skips a name with no value instead of sending an empty key', () => {
     const cursor = createKeyCursor({ names: ['A', 'B'], read: secrets({ B: 'k2' }) });
     expect(cursor.current()).toEqual({ name: 'B', value: 'k2' });
+  });
+
+  it('retries a replaced key without advancing to the backup when the previous value is refused', () => {
+    const values = { A: 'old-key', B: 'backup' };
+    const cursor = createKeyCursor({ names: ['A', 'B'], read: secrets(values) });
+    const sent = cursor.current()!;
+    values.A = 'new-key';
+    expect(cursor.refuse(sent)).toBe(true);
+    expect(cursor.current()).toEqual({ name: 'A', value: 'new-key' });
   });
 });
 describe('Messages stream that ends without its terminal event', () => {

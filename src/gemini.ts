@@ -11,14 +11,16 @@
  */
 import type { Logger } from 'cortico/core/types.ts';
 import { nullLogger } from 'cortico/core/util.ts';
-import type { GenerateOptions, Generation, TokenMeters } from 'cortico/core/generation.ts';
+import { standardUsage, type GenerateOptions, type Generation, type GenerationError, type TokenMeters } from 'cortico/core/generation.ts';
 import type { Request, Response, StreamEvent } from 'cortico/protocol/open-responses/index.ts';
+import { createResponse } from 'cortico/protocol/open-responses/index.ts';
 import { OpenAIHttpClient } from 'cortico/providers/transport/chat.ts';
 import { ChatResponseAssembly, type ResponseAssembly } from 'cortico/providers/transport/response-assembly.ts';
+import { chatMeters } from 'cortico/providers/transport/response-meters.ts';
 import { StreamErrorEvent } from 'cortico/providers/transport/errors.ts';
 import { renderMessagesWithMedia, type CompatMediaOptions } from 'cortico/providers/transport/history.ts';
 import { nativeChatInput, requestSpec, requestTools } from 'cortico/providers/transport/native-input.ts';
-import { RequestIdentity } from './identity.ts';
+import { RequestIdentity, type RequestCredentials } from './identity.ts';
 import { geminiThinking } from './protocol-contract.ts';
 import { SignatureStore } from './signatures.ts';
 import { parseDataUrl } from './attachments.ts';
@@ -83,17 +85,11 @@ export function buildGeminiBody(request: Request, options: GenerateOptions, medi
     if (!parts.length) return;
     const last = contents[contents.length - 1];
     if (last && last.role === role) {
-      // Gemini requires the number of functionResponse parts in a turn to equal the number of
-      // functionCall parts in the preceding turn, so parallel results must share one turn. A text part
-      // in that turn would break it, though, so only responses merge with responses.
+      // Keep parallel responses together, then append any immediately following user text.
+      // A separate text-only user turn after tool responses can fail on Gemini 4 Argon.
       const lastIsResponse = last.parts.some((part) => 'functionResponse' in part);
       const partsAreResponses = parts.every((part) => 'functionResponse' in part);
-      if (lastIsResponse && partsAreResponses) {
-        last.parts.push(...parts);
-        return;
-      }
-      // Plain text still joins a text turn, which keeps consecutive user messages together.
-      if (!lastIsResponse && !parts.some((part) => 'functionResponse' in part)) {
+      if (lastIsResponse ? partsAreResponses || parts.every((part) => 'text' in part) : !partsAreResponses) {
         last.parts.push(...parts);
         return;
       }
@@ -140,8 +136,7 @@ export function buildGeminiBody(request: Request, options: GenerateOptions, medi
   flushToolMedia();
   // Gemini refuses a request whose last content is `model` ("Requests ending with a model turn are not
   // supported"). That happens whenever the framework sends history that ends on an assistant turn — for
-  // example a round cut short after a tool call, or a turn that only pushed events. The nudge is pushed
-  // as its own turn, never merged, because merging text into a response turn breaks it (see `push`).
+  // example a round cut short after a tool call, or a turn that only pushed events.
   const tail = contents[contents.length - 1];
   if (tail && tail.role === 'model') contents.push({ role: 'user', parts: [{ text: CONTINUE_PROMPT }] });
   const body: Record<string, unknown> = { contents };
@@ -198,6 +193,33 @@ const FINISH_REASONS: Readonly<Record<string, string>> = {
   IMAGE_RECITATION: 'content_filter',
 };
 
+export class GeminiMalformedResponse extends StreamErrorEvent {
+  constructor(message: string, readonly meters: TokenMeters, readonly responseId?: string) {
+    super(message);
+  }
+}
+
+/** A malformed terminal frame does not confirm pending tool calls. Keep only streamed text. */
+export function incompleteGeminiResponse(request: Request, error: GenerationError, failure: GeminiMalformedResponse): Generation {
+  const response = error.partial ?? createResponse(failure.responseId ?? `resp_${crypto.randomUUID()}`, request);
+  return {
+    response: {
+      ...response,
+      output: response.output.flatMap(item => {
+        if (item.type !== 'message') return [];
+        const content = item.content.filter(part => part.type === 'output_text' && part.text);
+        return content.length ? [{ ...item, status: 'incomplete', content }] : [];
+      }),
+      status: 'incomplete',
+      completed_at: Math.floor(Date.now() / 1000),
+      incomplete_details: { reason: 'upstream_malformed_response' },
+      usage: standardUsage(failure.meters),
+    },
+    origin: error.origin,
+    attempts: error.attempts,
+  };
+}
+
 function chatUsage(raw: Shape | null | undefined): Record<string, unknown> | undefined {
   if (!raw) return undefined;
   const number = (value: unknown): number | null => (typeof value === 'number' && Number.isFinite(value) ? value : null);
@@ -222,6 +244,7 @@ export class GeminiAssembly implements ResponseAssembly {
   private readonly inner: ChatResponseAssembly;
   private calls = 0;
   private finishReason: string | null = null;
+  private failureMeters?: TokenMeters;
 
   constructor(request: Request, private readonly signatures?: SignatureStore) {
     this.inner = new ChatResponseAssembly(request);
@@ -240,7 +263,16 @@ export class GeminiAssembly implements ResponseAssembly {
     }
     if (typeof candidate.finishReason === 'string') {
       const reason = FINISH_REASONS[candidate.finishReason];
-      if (!reason) throw new StreamErrorEvent(`Gemini generation ended with ${candidate.finishReason}`);
+      if (!reason) {
+        if (usage) this.failureMeters = chatMeters(usage);
+        const message = `Gemini generation ended with ${candidate.finishReason}`;
+        if (candidate.finishReason === 'MALFORMED_RESPONSE' || candidate.finishReason === 'MALFORMED_FUNCTION_CALL') {
+          // Leave the recovery decision to the provider, after metering the failed stream.
+          const id = typeof chunk.responseId === 'string' ? chunk.responseId : undefined;
+          throw new GeminiMalformedResponse(message, this.meters(), id);
+        }
+        throw new StreamErrorEvent(message);
+      }
       this.finishReason = reason;
     }
     const parts = (candidate.content?.parts ?? []) as Shape[];
@@ -271,7 +303,7 @@ export class GeminiAssembly implements ResponseAssembly {
   }
 
   snapshot(): Response | null { return this.inner.snapshot(); }
-  meters(): TokenMeters { return this.inner.meters(); }
+  meters(): TokenMeters { return this.failureMeters ?? this.inner.meters(); }
   serviceTier(): string | null { return this.inner.serviceTier(); }
 }
 
@@ -283,30 +315,21 @@ export function parseGeminiResponse(raw: unknown, request: Request, signatures?:
   return { response, meters: assembler.meters(), serviceTier: assembler.serviceTier() };
 }
 
-export interface GeminiOptions {
+export interface GeminiOptions extends RequestCredentials {
   baseUrl: string;
-  apiKey?: string;
-  /** Read per attempt so a refused key can be swapped for the next one; takes precedence over `apiKey`. */
-  apiKeyOf?: () => string | undefined;
-  onKeyRefused?: () => void;
   log?: Logger;
   media?: CompatMediaOptions;
 }
 
 export class OpenCodeGemini extends OpenAIHttpClient {
-  private readonly apiKey?: string;
-  private readonly apiKeyOf?: () => string | undefined;
-  private readonly onKeyRefused?: () => void;
   private readonly media?: CompatMediaOptions;
-  private readonly identity = new RequestIdentity();
+  private readonly identity: RequestIdentity;
   /** Survives across rounds: the registry reuses one instance per endpoint (registry.ts keeps a cache). */
   private readonly signatures = new SignatureStore();
 
   constructor(opts: GeminiOptions) {
     super(opts.baseUrl, opts.log ?? nullLogger());
-    this.apiKey = opts.apiKey;
-    this.apiKeyOf = opts.apiKeyOf;
-    this.onKeyRefused = opts.onKeyRefused;
+    this.identity = new RequestIdentity(opts);
     this.media = opts.media;
   }
 
@@ -331,7 +354,16 @@ export class OpenCodeGemini extends OpenAIHttpClient {
   }
 
   protected override parseResponse(raw: unknown, request: Request): { response: Response; meters: TokenMeters; serviceTier: string | null } {
-    return parseGeminiResponse(raw, request, this.signatures);
+    try {
+      return parseGeminiResponse(raw, request, this.signatures);
+    } catch (error) {
+      if (!(error instanceof GeminiMalformedResponse)) throw error;
+      // The unary transport records meters from a parsed failed response before it retries.
+      const response = createResponse(error.responseId ?? `resp_${crypto.randomUUID()}`, request);
+      response.status = 'failed';
+      response.error = { code: 'server_error', message: error.body };
+      return { response, meters: error.meters, serviceTier: null };
+    }
   }
 
   /** Gemini streams over SSE through `alt=sse`; there is no `stream` flag in the body. */
@@ -339,24 +371,14 @@ export class OpenCodeGemini extends OpenAIHttpClient {
     return;
   }
 
-  /** The key for this attempt, so rotation happens between transport attempts rather than per request. */
-  private key(): string | undefined {
-    return this.apiKeyOf?.() ?? this.apiKey;
-  }
-
-  /** Answering true makes the framework retry once, with the next key in the header. */
   protected override async onAuthError(): Promise<boolean> {
-    if (!this.onKeyRefused || !this.apiKeyOf) return false;
-    this.onKeyRefused();
-    return true;
+    return this.identity.keyRefused();
   }
 
   protected headers(): Record<string, string> {
-    const key = this.key();
     return {
       'Content-Type': 'application/json',
       ...this.identity.headers(),
-      ...(key ? { Authorization: `Bearer ${key}` } : {}),
     };
   }
 }

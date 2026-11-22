@@ -165,15 +165,12 @@ export const OPENCODE = {
       cacheFile: join(host.stateDir, 'models.json'),
       // Read per request: the gateway filters its listing by account, and a key saved after this
       // instance was built must still narrow the list.
-      apiKey: () => cursor.current()?.value ?? (entry.secret ? host.secret(entry.secret) : undefined),
+      apiKey: () => cursor.current()?.value,
     });
-    const apiKey = entry.secret ? host.secret(entry.secret) : undefined;
     const provider = new OpenCodeProvider({
       baseUrl: gateway ? baseUrlOf(gateway, billing, protocol) : entry.baseUrl,
       protocol,
-      apiKey,
-      apiKeyOf: () => cursor.current()?.value,
-      onKeyRefused: () => cursor.refuse(),
+      keyCursor: cursor,
       log: host.log,
       media: guardedMedia({
         enabled: () => currentEntry().multimodal === true,
@@ -193,11 +190,11 @@ export const OPENCODE = {
       ledger,
     });
     const control: UsageControl = {
-      hasKey: () => Boolean(entry.secret && host.secret(entry.secret)),
+      hasKey: () => cursor.current() !== null,
       read: async () => {
         // The key is read again here: the operator may have saved it after this instance was built,
         // and allowance belongs to the account the current key pays with.
-        const key = cursor.current()?.value ?? (entry.secret ? host.secret(entry.secret) : undefined);
+        const key = cursor.current()?.value;
         const usage = await readUsage(gateway!, key, session);
         ledger.clear();
         return usage;

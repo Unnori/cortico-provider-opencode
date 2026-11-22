@@ -19,7 +19,7 @@ import { StreamErrorEvent } from 'cortico/providers/transport/errors.ts';
 import type { CompatMediaOptions } from 'cortico/providers/transport/history.ts';
 import { renderMessagesWithMedia } from 'cortico/providers/transport/history.ts';
 import { nativeChatInput, requestContext, requestSpec, requestTools } from 'cortico/providers/transport/native-input.ts';
-import { RequestIdentity } from './identity.ts';
+import { RequestIdentity, type RequestCredentials } from './identity.ts';
 import { messagesForcedToolsAllowed, messagesSamplingAllowed, messagesThinking } from './protocol-contract.ts';
 import { parseDataUrl } from './attachments.ts';
 import { chatImageCount, mediaForRequest } from './images.ts';
@@ -343,29 +343,20 @@ export function parseMessages(raw: unknown, request: Request): { response: Respo
   return { response, meters: assembler.meters(), serviceTier: assembler.serviceTier() };
 }
 
-export interface MessagesOptions {
+export interface MessagesOptions extends RequestCredentials {
   baseUrl: string;
-  apiKey?: string;
-  /** Read per attempt so a refused key can be swapped for the next one; takes precedence over `apiKey`. */
-  apiKeyOf?: () => string | undefined;
-  onKeyRefused?: () => void;
   log?: Logger;
   media?: CompatMediaOptions;
 }
 
 export class OpenCodeMessages extends OpenAIHttpClient {
-  private readonly apiKey?: string;
-  private readonly apiKeyOf?: () => string | undefined;
-  private readonly onKeyRefused?: () => void;
   private readonly media?: CompatMediaOptions;
-  private readonly identity = new RequestIdentity();
+  private readonly identity: RequestIdentity;
 
   constructor(opts: MessagesOptions) {
     super(opts.baseUrl, opts.log ?? nullLogger());
     this.chatPath = '/messages';
-    this.apiKey = opts.apiKey;
-    this.apiKeyOf = opts.apiKeyOf;
-    this.onKeyRefused = opts.onKeyRefused;
+    this.identity = new RequestIdentity(opts);
     this.media = opts.media;
   }
 
@@ -402,25 +393,15 @@ export class OpenCodeMessages extends OpenAIHttpClient {
     body.stream = true;
   }
 
-  /** The key for this attempt, so rotation happens between transport attempts rather than per request. */
-  private key(): string | undefined {
-    return this.apiKeyOf?.() ?? this.apiKey;
-  }
-
-  /** Answering true makes the framework retry once, with the next key in the header. */
   protected override async onAuthError(): Promise<boolean> {
-    if (!this.onKeyRefused || !this.apiKeyOf) return false;
-    this.onKeyRefused();
-    return true;
+    return this.identity.keyRefused();
   }
 
   protected headers(): Record<string, string> {
-    const key = this.key();
     return {
       'Content-Type': 'application/json',
       'anthropic-version': ANTHROPIC_VERSION,
       ...this.identity.headers(),
-      ...(key ? { Authorization: `Bearer ${key}` } : {}),
     };
   }
 }

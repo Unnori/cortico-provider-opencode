@@ -176,4 +176,17 @@ describe('reported billable meters', () => {
     applyGatewayMeters(ambiguous);
     expect(ambiguous.attempts[0].charges[0].amount).toBeNull();
   });
+
+  it.each([
+    { cost: 0, opencode: { billing_source: 'go' } },
+    { cost: 0.02, opencode: { billing_source: 'byok', estimated: true } },
+    { cost: -1, opencode: { billing_source: 'balance' } },
+    { cost: '0.02', opencode: { billing_source: 'balance' } },
+    { cost: 0.02, opencode: { billing_source: 'balance', estimated: true } },
+  ])('keeps the price snapshot when the gateway does not report a valid balance charge (%j)', native => {
+    const result = generation(native, [{ meter: 'output', perMillion: 2 }]);
+    result.attempts[0].meters.output = 10000;
+    applyGatewayMeters(result);
+    expect(result.attempts[0].charges).toMatchObject([{ amount: 0.02, quote: { source: 'fixture' } }]);
+  });
 });

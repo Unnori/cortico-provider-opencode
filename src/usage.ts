@@ -1,8 +1,8 @@
 /**
  * The Go allowance windows. `GET <root>/go/v1/usage` answers with the three windows the Go page
  * defines — `rolling` (5 hours), `weekly`, `monthly` — each with a percentage and the moment it resets.
- * The endpoint is not in OpenCode's published API reference, so a failed read is reported rather than
- * retried, and the panel keeps what it last saw.
+ * See https://opencode.ai/docs/console/go/#usage. A failed read leaves the last successful reading
+ * in the panel.
  *
  * Between reads the bars can also move on this process's own spend: each finished generation reports
  * its charge, and the Go page states a model's monthly allowance, so dollars spent on a model convert

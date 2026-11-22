@@ -11,11 +11,16 @@
  * endpoint share a single position.
  */
 
+export interface KeyCredential {
+  name: string;
+  value: string;
+}
+
 export interface KeyCursor {
   /** The key to send right now, or null when this endpoint has no usable secret. */
-  current(): { name: string; value: string } | null;
-  /** Record that the account refused the current key, and move on when another one is configured. */
-  refuse(): void;
+  current(): KeyCredential | null;
+  /** Advance only for the rejected credential. Return true if a different key is available. */
+  refuse(attempted: KeyCredential): boolean;
   /** Position in `names`, for the panel. */
   index(): number;
   /** Names in rotation order, for the panel. */
@@ -30,29 +35,26 @@ export interface KeyCursorOptions {
 export function createKeyCursor(opts: KeyCursorOptions): KeyCursor {
   let index = 0;
 
-  const usable = (name: string): boolean => Boolean(opts.read(name));
+  function select(start: number, rejectedValue?: string): KeyCredential | null {
+    for (let step = start; step < opts.names.length; step++) {
+      const name = opts.names[step];
+      const value = opts.read(name);
+      if (value && value !== rejectedValue) {
+        index = step;
+        return { name, value };
+      }
+    }
+    return null;
+  }
 
   return {
-    current(): { name: string; value: string } | null {
-      // One name is an ordinary endpoint: use it or report nothing, and never rotate.
-      if (opts.names.length <= 1) {
-        const name = opts.names[0];
-        if (!name) return null;
-        const value = opts.read(name);
-        return value ? { name, value } : null;
-      }
-      for (let step = index; step < opts.names.length; step++) {
-        const name = opts.names[step];
-        if (name && usable(name)) {
-          index = step;
-          return { name, value: opts.read(name) };
-        }
-      }
-      return null;
-    },
-    refuse(): void {
-      if (opts.names.length <= 1) return;
-      if (index < opts.names.length - 1) index += 1;
+    current: () => select(index),
+    refuse(attempted): boolean {
+      const active = select(index);
+      if (!active) return false;
+      if (active.value !== attempted.value) return true;
+      if (active.name !== attempted.name) return false;
+      return select(index + 1, attempted.value) !== null;
     },
     index(): number {
       return index;

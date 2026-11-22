@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { nullLogger } from 'cortico/core/util.ts';
 import { functionCall, functionResult, message, record } from 'cortico/protocol/open-responses/context.ts';
 import { OpenCodeProvider } from '../src/native.ts';
 import { buildGeminiBody, GeminiAssembly, geminiSchema, parseGeminiResponse } from '../src/gemini.ts';
@@ -144,6 +145,112 @@ describe('documented protocol contracts', () => {
     for (const raw of [{ promptFeedback: { blockReason: 'SAFETY' } }, { candidates: [{ finishReason: 'MALFORMED_FUNCTION_CALL' }] }]) {
       expect(() => parseGeminiResponse(raw, { input: [] })).toThrow();
     }
+  });
+
+  const geminiStream = (...chunks: unknown[]) => new Response(chunks.map(chunk => `data: ${JSON.stringify(chunk)}\n\n`).join(''), {
+    headers: { 'Content-Type': 'text/event-stream' },
+  });
+  const usageMetadata = { promptTokenCount: 100, cachedContentTokenCount: 75, totalTokenCount: 100, cost: 0,
+    opencode: { billing_source: 'go', allowance: 0.02 } };
+
+  it.each(['MALFORMED_RESPONSE', 'MALFORMED_FUNCTION_CALL'])('bounds retries and keeps the usage of streams ending in %s', async finishReason => {
+    const chunk = {
+      candidates: [{ content: { parts: [{ functionCall: { name: 'draw', args: {} } }] }, finishReason }],
+      usageMetadata,
+    };
+    let responseId = 0;
+    const fetch = vi.fn(async () => geminiStream({ ...chunk, responseId: `failed-${++responseId}` }));
+    vi.stubGlobal('fetch', fetch);
+    const client = new OpenCodeProvider({ baseUrl: 'https://fixture.invalid', protocol: 'gemini', keepThinking: () => false });
+    const onEvent = vi.fn();
+    const generation = await client.respond({ model: 'fixture', input: 'hi' }, { onEvent });
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(generation.response).toMatchObject({ status: 'incomplete', output: [],
+      incomplete_details: { reason: 'upstream_malformed_response' } });
+    expect(generation.attempts.map(attempt => attempt.responseId)).toEqual(['failed-1', 'failed-2']);
+    for (const attempt of generation.attempts) expect(attempt).toMatchObject({ status: 200, outcome: 'failed',
+      meters: { input: 100, cachedInput: 75, uncachedInput: 25, total: 100,
+        native: { cost: 0, opencode: { allowance: 0.02 } } } });
+    expect(onEvent).not.toHaveBeenCalled();
+  });
+
+  it('retries without media while preserving completed tool history and text', async () => {
+    const context = [
+      message('user', 'Inspect attachment'),
+      functionCall('event', 'external_event_frame', '{}'),
+      functionResult('event', 'Incoming report', { frame: { events: [] }, blobs: [{ handle: 'log:pdf', mime: 'application/pdf', fallbackText: 'Report description' }] }),
+      functionCall('call_sent', 'draw', '{}'),
+      functionResult('call_sent', 'Already delivered'),
+    ];
+    const request = { model: 'fixture', input: [] };
+    const read = vi.fn(() => pdf);
+    const fetch = vi.fn(async (_url, _init) => geminiStream(answer('gemini')))
+      .mockResolvedValueOnce(geminiStream({ candidates: [{ finishReason: 'MALFORMED_RESPONSE' }], usageMetadata }));
+    vi.stubGlobal('fetch', fetch);
+    const client = new OpenCodeProvider({ baseUrl: 'https://fixture.invalid', protocol: 'gemini', keepThinking: () => false,
+      attachments: () => ({ protocol: 'gemini', facts: { input: ['pdf'] }, read }) });
+    const options = { context, sessionId: 'same-session', onEvent: vi.fn() };
+    const generation = await client.respond(request, options);
+    expect(generation.attempts.map(attempt => attempt.outcome)).toEqual(['failed', 'completed']);
+    const [first, second] = fetch.mock.calls.map(([, init]) => ({ body: JSON.parse(init.body), headers: init.headers }));
+    expect(first.body.contents.flatMap((turn: any) => turn.parts)).toContainEqual({ inlineData: { mimeType: 'application/pdf', data: pdf.toString('base64') } });
+    expect(JSON.stringify(second.body)).toContain('Inspect attachment');
+    expect(JSON.stringify(second.body)).toContain('Incoming report');
+    expect(JSON.stringify(second.body)).toContain('Report description');
+    expect(JSON.stringify(second.body)).not.toContain('inlineData');
+    expect(second.body.contents.slice(-2)).toEqual(first.body.contents.slice(-2));
+    expect(first.headers['x-opencode-session']).toBe('same-session');
+    expect(second.headers['x-opencode-session']).toBe('same-session');
+    expect(read).toHaveBeenCalledTimes(1);
+    expect(context[2].context.blobs).toHaveLength(1);
+    await client.respond(request, options);
+    expect(JSON.parse(fetch.mock.calls[2][1].body).contents.flatMap((turn: any) => turn.parts)).toContainEqual(expect.objectContaining({ inlineData: expect.anything() }));
+  });
+
+  it('keeps streamed text and drops unconfirmed calls after a malformed finish', async () => {
+    const fetch = vi.fn(async () => geminiStream(
+      { candidates: [{ content: { parts: [{ text: 'Already streamed' }, { functionCall: { name: 'draw', args: {} } }] } }] },
+      { candidates: [{ finishReason: 'MALFORMED_RESPONSE' }], usageMetadata },
+    ));
+    vi.stubGlobal('fetch', fetch);
+    const client = new OpenCodeProvider({ baseUrl: 'https://fixture.invalid', protocol: 'gemini', keepThinking: () => false });
+    const onEvent = vi.fn();
+    const generation = await client.respond({ model: 'fixture', input: 'hi' }, { onEvent });
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(generation.response.status).toBe('incomplete');
+    expect(generation.response.output).toEqual([expect.objectContaining({ type: 'message', status: 'incomplete',
+      content: [expect.objectContaining({ type: 'output_text', text: 'Already streamed' })] })]);
+    expect(onEvent.mock.calls.some(([event]) => event.type === 'response.output_item.done' && event.item.type === 'function_call')).toBe(false);
+  });
+
+  it('cancels a pending retry while retaining the first failed attempt', async () => {
+    const fetch = vi.fn(async () => geminiStream({ candidates: [{ finishReason: 'MALFORMED_RESPONSE' }], usageMetadata }));
+    vi.stubGlobal('fetch', fetch);
+    const controller = new AbortController();
+    const log = { ...nullLogger(), warn: (message: string) => {
+      if (message === 'opencode: retrying malformed Gemini response') queueMicrotask(() => controller.abort());
+    } };
+    const client = new OpenCodeProvider({ baseUrl: 'https://fixture.invalid', protocol: 'gemini', keepThinking: () => false, log });
+    await expect(client.respond({ model: 'fixture', input: 'hi' }, { onEvent: vi.fn(), signal: controller.signal })).rejects.toMatchObject({
+      attempts: [{ outcome: 'failed', meters: { input: 100 } }],
+    });
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('retains failed unary Gemini attempt usage when the transport retries', async () => {
+    const failure = {
+      candidates: [{ finishReason: 'MALFORMED_RESPONSE' }], responseId: 'failed-native-response',
+      usageMetadata: { promptTokenCount: 10, cachedContentTokenCount: 6, totalTokenCount: 10 },
+    };
+    const fetch = vi.fn(async () => new Response(JSON.stringify(answer('gemini'))))
+      .mockResolvedValueOnce(new Response(JSON.stringify(failure)));
+    vi.stubGlobal('fetch', fetch);
+    const client = new OpenCodeProvider({ baseUrl: 'https://fixture.invalid', protocol: 'gemini', keepThinking: () => false });
+    const generation = await client.respond({ model: 'fixture', input: 'hi' });
+    expect(generation.response.status).toBe('completed');
+    expect(generation.attempts.map(attempt => attempt.outcome)).toEqual(['failed', 'completed']);
+    expect(generation.attempts[0]).toMatchObject({ responseId: failure.responseId, status: 200,
+      meters: { input: 10, cachedInput: 6, uncachedInput: 4, total: 10 } });
   });
 
   it('uses model-specific documented thinking modes and leaves unknown models unset', () => {

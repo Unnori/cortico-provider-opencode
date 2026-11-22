@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
+import type { KeyCredential, KeyCursor } from './rotation.ts';
 
 /**
  * How this package identifies itself to the gateway. OpenCode asks clients to name themselves rather
@@ -32,17 +33,38 @@ export function identityHeaders(session: string): Record<string, string> {
   return { 'User-Agent': USER_AGENT, [SESSION_HEADER]: id };
 }
 
+export interface RequestCredentials {
+  apiKey?: string;
+  keyCursor?: KeyCursor;
+}
+
 /** The HTTP transport asks for headers again on retry, after other requests may have started. */
 export class RequestIdentity {
-  private readonly session = new AsyncLocalStorage<string>();
+  private readonly request = new AsyncLocalStorage<{ session: string; credential: KeyCredential | null }>();
   private readonly fallback = newSession();
+
+  constructor(private readonly credentials: RequestCredentials) {}
 
   run<T>(session: string | undefined, send: () => T): T {
     const id = typeof session === 'string' ? session.trim() : '';
-    return this.session.run(id || this.fallback, send);
+    return this.request.run({ session: id || this.fallback, credential: null }, send);
   }
 
   headers(): Record<string, string> {
-    return identityHeaders(this.session.getStore() ?? this.fallback);
+    const request = this.request.getStore();
+    const cursor = this.credentials.keyCursor;
+    const credential = cursor?.current() ?? null;
+    if (request) request.credential = credential;
+    const key = cursor ? credential?.value : this.credentials.apiKey;
+    return {
+      ...identityHeaders(request?.session ?? this.fallback),
+      ...(key ? { Authorization: `Bearer ${key}` } : {}),
+    };
+  }
+
+  /** Cortico calls this after a 401/403 and retries only when it returns true. */
+  keyRefused(): boolean {
+    const attempted = this.request.getStore()?.credential;
+    return attempted != null && this.credentials.keyCursor?.refuse(attempted) === true;
   }
 }
